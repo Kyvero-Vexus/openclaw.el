@@ -164,8 +164,8 @@
                    openclaw--sessions)
           (setq openclaw--handshake-complete t)
           (openclaw--switch-to-session "agent:main:main")
-          (let ((buf (get-buffer "*openclaw:Main Session*")))
-            (oc-test-assert-nonnil buf "Session buffer created with correct name")
+          (let ((buf (get-buffer "*agent:main:main*")))
+            (oc-test-assert-nonnil buf "Session buffer created with session-key name")
             (when buf
               (with-current-buffer buf
                 (oc-test-assert-equal 'openclaw-chat-mode major-mode
@@ -274,6 +274,64 @@
                          "openclaw-system-face defined")
   (oc-test-assert-nonnil (facep 'openclaw-timestamp-face)
                          "openclaw-timestamp-face defined"))
+
+(oc-test-deftest spec-03.6-assistant-label-uses-agent-name
+  "SPEC-03.6: Assistant label uses agent name from session key."
+  (with-temp-buffer
+    (openclaw-chat-mode)
+    (setq-local openclaw--current-session "agent:ceo_chryso:main")
+    (openclaw--insert-input-area "")
+    (openclaw--handle-chat-message
+     '((sessionKey . "agent:ceo_chryso:main")
+       (role . "assistant")
+       (content . "hello")))
+    (let ((txt (buffer-string)))
+      (oc-test-assert-match "ceo_chryso:" txt
+                            "Assistant messages show agent name label"))))
+
+(oc-test-deftest spec-03.7-markdown-rendering
+  "SPEC-03.7: Markdown gets font-lock style properties."
+  (with-temp-buffer
+    (openclaw-chat-mode)
+    (openclaw--insert-input-area "")
+    (openclaw--insert-message-before-input
+     "Assistant: " 'openclaw-assistant-face "**bold** and `code`")
+    (goto-char (point-min))
+    (search-forward "bold")
+    (let ((bold-face (get-text-property (1- (point)) 'face)))
+      (oc-test-assert-nonnil bold-face "Bold markdown has face property"))
+    (search-forward "code")
+    (let ((code-face (get-text-property (1- (point)) 'face)))
+      (oc-test-assert-nonnil code-face "Code markdown has face property"))))
+
+(oc-test-deftest spec-03.8-inline-image-render-call
+  "SPEC-03.8: Inline image URLs attempt image insertion."
+  (let ((img-called nil)
+        (insert-called nil))
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _args) (setq img-called t) 'mock-image))
+              ((symbol-function 'insert-image)
+               (lambda (&rest _args) (setq insert-called t))))
+      (with-temp-buffer
+        (openclaw--insert-rendered-content "![alt](https://x.test/a.svg)")
+        (oc-test-assert img-called "create-image invoked for inline image")
+        (oc-test-assert insert-called "insert-image invoked for inline image")))))
+
+(oc-test-deftest spec-03.9-heartbeat-comment-face
+  "SPEC-03.9: Heartbeat text is shown with comment face."
+  (with-temp-buffer
+    (openclaw-chat-mode)
+    (openclaw--insert-input-area "")
+    (openclaw--insert-message-before-input
+     "System: " 'openclaw-system-face "HEARTBEAT_OK")
+    (goto-char (point-min))
+    (search-forward "HEARTBEAT_OK")
+    (let ((face (get-text-property (1- (point)) 'face)))
+      (oc-test-assert face "Heartbeat text has a face")
+      (oc-test-assert (or (eq face 'font-lock-comment-face)
+                          (and (listp face) (memq 'font-lock-comment-face face)))
+                      "Heartbeat uses comment-like styling"))))
 
 ;;; ============================================================
 ;;; SPEC-04: Slash Commands and Key Bindings
@@ -386,12 +444,12 @@
           (puthash "sess-b" '((key . "sess-b") (label . "Beta")) openclaw--sessions)
           (openclaw--switch-to-session "sess-a")
           (openclaw--switch-to-session "sess-b")
-          (oc-test-assert-nonnil (get-buffer "*openclaw:Alpha*")
-                                 "Alpha session buffer exists")
-          (oc-test-assert-nonnil (get-buffer "*openclaw:Beta*")
-                                 "Beta session buffer exists")
-          (ignore-errors (kill-buffer "*openclaw:Alpha*"))
-          (ignore-errors (kill-buffer "*openclaw:Beta*"))))
+          (oc-test-assert-nonnil (get-buffer "*sess-a*")
+                                 "sess-a session buffer exists")
+          (oc-test-assert-nonnil (get-buffer "*sess-b*")
+                                 "sess-b session buffer exists")
+          (ignore-errors (kill-buffer "*sess-a*"))
+          (ignore-errors (kill-buffer "*sess-b*"))))
     (oc-mock--uninstall)))
 
 (oc-test-deftest spec-06.3-help-buffer
@@ -455,6 +513,47 @@
   (oc-test-assert-equal #'openclaw-send-message
                         (lookup-key openclaw-chat-mode-map (kbd "RET"))
                         "RET sends current input box"))
+
+(oc-test-deftest spec-06.7-status-bar-content
+  "SPEC-06.7: Input separator status line includes connection/agent/session info."
+  (cl-letf (((symbol-function 'openclaw-connected-p) (lambda () t)))
+    (with-temp-buffer
+      (openclaw-chat-mode)
+      (setq-local openclaw--current-session "agent:ceo_chryso:main")
+      (setq openclaw--current-agent "ceo_chryso")
+      (openclaw--insert-input-area "")
+      (let ((txt (buffer-string)))
+        (oc-test-assert-match "connected" txt "Status bar shows connection")
+        (oc-test-assert-match "agent:ceo_chryso" txt "Status bar shows agent")
+        (oc-test-assert-match "session:agent:ceo_chryso:main" txt
+                              "Status bar shows current session")))))
+
+(oc-test-deftest spec-06.8-heartbeat-does-not-break-chat
+  "SPEC-06.8: Heartbeat rendering does not break subsequent sending."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect)
+        (oc-mock--complete-handshake)
+        (setq oc-mock--sent-frames nil)
+        (with-temp-buffer
+          (openclaw-chat-mode)
+          (setq-local openclaw--current-session "agent:ceo_chryso:main")
+          (openclaw--insert-input-area "")
+          (openclaw--handle-chat-message
+           '((sessionKey . "agent:ceo_chryso:main")
+             (role . "system")
+             (content . "HEARTBEAT_OK")))
+          (goto-char (point-max))
+          (insert "test")
+          (openclaw-send-message)
+          (let* ((sent (oc-mock--last-sent-parsed))
+                 (params (alist-get 'params sent)))
+            (oc-test-assert-equal "chat.send" (alist-get 'method sent)
+                                  "Can still send after heartbeat")
+            (oc-test-assert-equal "test" (alist-get 'message params)
+                                  "Post-heartbeat input sends correctly"))))
+    (oc-mock--uninstall)))
 
 ;;; ============================================================
 ;;; SPEC-07: Mode Line
