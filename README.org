@@ -14,11 +14,29 @@ Each OpenClaw session becomes its own Emacs buffer, and you get:
 
 * Installation
 
-** From MELPA (coming soon)
+** With straight.el and use-package (recommended)
+
+If you use [[https://github.com/radian-software/straight.el][straight.el]] with [[https://github.com/jwiegley/use-package][use-package]], add this to your init file:
 
 #+begin_src elisp
 (use-package openclaw
-  :ensure t)
+  :straight (openclaw :type git :host github :repo "Kyvero-Vexus/openclaw.el")
+  :config
+  (setq openclaw-gateway-url "ws://127.0.0.1:18789"))
+#+end_src
+
+** With straight.el only
+
+#+begin_src elisp
+(straight-use-package
+ '(openclaw :type git :host github :repo "Kyvero-Vexus/openclaw.el"))
+#+end_src
+
+** With Quelpa
+
+#+begin_src elisp
+(use-package openclaw
+  :quelpa (openclaw :fetcher github :repo "Kyvero-Vexus/openclaw.el"))
 #+end_src
 
 ** Manual installation
@@ -34,6 +52,8 @@ Clone this repository and add to your =load-path=:
 
 - Emacs 27.1 or later
 - [[https://github.com/ahyatt/emacs-websocket][websocket]] package (for WebSocket communication)
+
+straight.el and package.el will install dependencies automatically.
 
 * Quick Start
 
