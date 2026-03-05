@@ -1,4 +1,4 @@
-;;; openclaw.el --- Emacs interface to OpenClaw -*- lexical-binding: t; -*-
+;;; openclaw.el --- Emacs interface to OpenClaw -*- lexical-binding: t; coding: utf-8; -*-
 
 ;; Copyright (C) 2026 Kyvero Vexus Corporation
 
@@ -85,14 +85,25 @@ Used if token is not set."
   :type 'string
   :group 'openclaw)
 
-(defcustom openclaw-session-buffer-name "*openclaw:%s*"
-  "Format string for session buffer names."
+(defcustom openclaw-session-buffer-name "*%s*"
+  "Format string for session buffer names.
+Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
   :type 'string
   :group 'openclaw)
 
 (defcustom openclaw-history-limit 200
   "Number of history messages to load."
   :type 'integer
+  :group 'openclaw)
+
+(defcustom openclaw-render-markdown t
+  "Whether to render markdown-like formatting in message text."
+  :type 'boolean
+  :group 'openclaw)
+
+(defcustom openclaw-inline-images t
+  "Whether to attempt inline rendering of images/SVGs from message text."
+  :type 'boolean
   :group 'openclaw)
 
 
@@ -126,6 +137,11 @@ Used if token is not set."
 (defface openclaw-session-header-face
   '((t :foreground "white" :weight bold :underline t))
   "Face for session headers."
+  :group 'openclaw)
+
+(defface openclaw-status-bar-face
+  '((t :inherit mode-line :height 0.95))
+  "Face for the separator/status line above the input box."
   :group 'openclaw)
 
 
@@ -474,7 +490,9 @@ If URL is nil, use `openclaw-gateway-url'."
 (defun openclaw-connected-p ()
   "Return non-nil if connected to gateway."
   (and openclaw--websocket
-       (websocket-openp openclaw--websocket)))
+       (condition-case nil
+           (websocket-openp openclaw--websocket)
+         (error nil))))
 
 
 ;;; Session Management
@@ -533,21 +551,25 @@ If URL is nil, use `openclaw-gateway-url'."
 (defun openclaw--switch-to-session (session-key)
   "Switch to or create buffer for SESSION-KEY."
   (let* ((session-info (gethash session-key openclaw--sessions))
-         (label (or (and session-info
-                        (or (alist-get 'label session-info)
-                            (alist-get 'displayName session-info)))
-                   session-key))
-         (buf-name (format openclaw-session-buffer-name label))
+         (display-name (or (and session-info
+                                (or (alist-get 'label session-info)
+                                    (alist-get 'displayName session-info)))
+                           session-key))
+         ;; Buffer name must mirror session identifier used in switch picker.
+         (buf-name (format openclaw-session-buffer-name session-key))
          (buf (get-buffer-create buf-name)))
     (with-current-buffer buf
       (unless (eq major-mode 'openclaw-chat-mode)
         (openclaw-chat-mode))
       (setq-local openclaw--current-session session-key)
-      (setq-local openclaw--session-label label)
+      (setq-local openclaw--session-label session-key)
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize (format "Session: %s\n" label)
+        (insert (propertize (format "Session: %s" session-key)
                             'face 'openclaw-session-header-face))
+        (when (and display-name (not (equal display-name session-key)))
+          (insert (format " (%s)" display-name)))
+        (insert "\n")
         (insert "Loading history...\n\n"))
       (openclaw--update-mode-line))
     (switch-to-buffer buf)
@@ -694,15 +716,103 @@ If URL is nil, use `openclaw-gateway-url'."
       ("tool" 'openclaw-tool-face)
       (_ 'default))))
 
-(defun openclaw--role-label (role)
-  "Return display label for ROLE."
+(defun openclaw--agent-from-session-key (session-key)
+  "Extract agent id from SESSION-KEY like agent:ceo_chryso:main."
+  (when (and (stringp session-key)
+             (string-match "^agent:\\([^:]+\\):" session-key))
+    (match-string 1 session-key)))
+
+(defun openclaw--role-label (role &optional session-key)
+  "Return display label for ROLE.
+For assistant messages, prefer agent name from SESSION-KEY."
   (let ((r (if (symbolp role) (symbol-name role) role)))
     (pcase r
       ("user" "You")
-      ("assistant" "Assistant")
+      ("assistant" (or (openclaw--agent-from-session-key session-key)
+                        openclaw--current-agent
+                        "Assistant"))
       ("system" "System")
       ("tool" "Tool")
-      (_ (capitalize r)))))
+      (_ (capitalize (format "%s" r))))))
+
+(defun openclaw--heartbeat-text-p (text)
+  "Return non-nil if TEXT looks like heartbeat content."
+  (and (stringp text)
+       (string-match-p "\\bHEARTBEAT_" text)))
+
+(defun openclaw--status-bar-text ()
+  "Return status text shown in the separator bar above input box."
+  (format " %s | agent:%s | session:%s | send: RET / C-c C-c "
+          (if (openclaw-connected-p) "connected" "disconnected")
+          (or openclaw--current-agent "?")
+          (or openclaw--current-session "?")))
+
+(defun openclaw--insert-markdown-text (text)
+  "Insert TEXT with lightweight markdown styling."
+  (let ((start (point)))
+    (insert (or text ""))
+    (when openclaw-render-markdown
+      (save-excursion
+        (save-restriction
+          (narrow-to-region start (point))
+          ;; Simple inline code: `...`
+          (goto-char (point-min))
+          (while (search-forward "`" nil t)
+            (let ((code-start (point)))
+              (when (search-forward "`" nil t)
+                (add-face-text-property code-start (1- (point))
+                                        'font-lock-constant-face t))))
+          ;; Simple bold: **...**
+          (goto-char (point-min))
+          (while (search-forward "**" nil t)
+            (let ((bold-start (point)))
+              (when (search-forward "**" nil t)
+                (add-face-text-property bold-start (- (point) 2)
+                                        'bold t))))
+          ;; Fenced code blocks: ```...```
+          (goto-char (point-min))
+          (while (search-forward "```" nil t)
+            (let ((block-start (point)))
+              (when (search-forward "```" nil t)
+                (add-face-text-property block-start (- (point) 3)
+                                        'font-lock-comment-face t)))))))))
+
+(defun openclaw--insert-inline-images-from-text (text)
+  "Try to render inline images referenced in TEXT.
+Supports markdown image links and direct image URLs (png/jpg/jpeg/gif/webp/svg)."
+  (when (and openclaw-inline-images (display-images-p) (stringp text))
+    (let ((case-fold-search t)
+          (urls '()))
+      ;; Markdown images: ![alt](url)
+      (save-match-data
+        (let ((pos 0))
+          (while (string-match "!\\[[^]]*\\](\\([^()]+\\))" text pos)
+            (push (match-string 1 text) urls)
+            (setq pos (match-end 0)))))
+      ;; Direct URLs
+      (save-match-data
+        (let ((pos 0))
+          (while (string-match "\\(https?://[^[:space:]\\n]+\\.\\(png\\|jpe?g\\|gif\\|webp\\|svg\\)\\)" text pos)
+            (push (match-string 1 text) urls)
+            (setq pos (match-end 1)))))
+      (dolist (url (delete-dups (nreverse urls)))
+        (condition-case nil
+            (let ((img (if (string-match-p "\\.svg\\(?:$\\|[?#]\\)" url)
+                           (create-image url 'svg nil)
+                         (create-image url nil nil))))
+              (when img
+                (insert "\n")
+                (insert-image img)
+                (insert "\n")))
+          (error nil))))))
+
+(defun openclaw--insert-rendered-content (content-text)
+  "Insert CONTENT-TEXT with markdown, heartbeat styling and inline images."
+  (let ((start (point)))
+    (openclaw--insert-markdown-text content-text)
+    (when (openclaw--heartbeat-text-p content-text)
+      (add-face-text-property start (point) 'font-lock-comment-face t))
+    (openclaw--insert-inline-images-from-text content-text)))
 
 (defun openclaw--input-text ()
   "Return current draft text from chat input area."
@@ -714,10 +824,16 @@ If URL is nil, use `openclaw-gateway-url'."
 (defun openclaw--insert-input-area (&optional draft)
   "Insert chat input area separator and editable box.
 Optional DRAFT pre-fills the input box."
-  (let ((separator (concat "\n" (make-string 72 ?─) "\n")))
-    (setq openclaw--input-separator-marker (copy-marker (point) t))
-    (insert separator)
-    (insert (propertize "Message (C-c C-c to send):\n" 'face 'openclaw-timestamp-face))
+  (let ((status (openclaw--status-bar-text)))
+    (insert "\n")
+    ;; Keep separator marker fixed at start of status bar.
+    (setq openclaw--input-separator-marker (copy-marker (point) nil))
+    (insert (propertize status 'face 'openclaw-status-bar-face))
+    (insert "\n")
+    (insert (propertize (make-string (max 10 (length status)) ?-)
+                        'face 'openclaw-status-bar-face))
+    (insert "\n")
+    (insert (propertize "Message:\n" 'face 'openclaw-timestamp-face))
     ;; Keep marker at beginning of input area as user types.
     (setq openclaw--input-start-marker (copy-marker (point) nil))
     (when draft (insert draft))))
@@ -733,7 +849,10 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
     (save-excursion
       (goto-char insert-pos)
       (insert (propertize prefix 'face prefix-face))
-      (insert content)
+      (let ((content-start (point)))
+        (openclaw--insert-rendered-content content)
+        (when (= content-start (point))
+          (insert "")))
       (insert "\n"))))
 
 (defun openclaw--fetch-history (session-key)
@@ -771,13 +890,13 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
                         (content-text (openclaw--content->text
                                        (alist-get 'content msg)))
                         (ts-str (openclaw--format-timestamp timestamp))
-                        (role-label (openclaw--role-label role))
+                        (role-label (openclaw--role-label role session-key))
                         (role-face (openclaw--role-face role)))
                    (insert (propertize ts-str 'face 'openclaw-timestamp-face))
                    (insert " ")
                    (insert (propertize (format "%s: " role-label)
                                        'face role-face))
-                   (insert content-text)
+                   (openclaw--insert-rendered-content content-text)
                    (insert "\n"))))
              (openclaw--insert-input-area draft)
              (goto-char (point-max))))))))))
@@ -787,7 +906,7 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
   (let* ((session-key (alist-get 'sessionKey params))
          (role (alist-get 'role params))
          (content-text (openclaw--content->text (alist-get 'content params)))
-         (role-label (openclaw--role-label role))
+         (role-label (openclaw--role-label role session-key))
          (role-face (openclaw--role-face role)))
     (cl-dolist (buf (buffer-list))
       (with-current-buffer buf
@@ -825,11 +944,6 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
 
     ;; Insert user message into history area.
     (openclaw--insert-message-before-input "You: " 'openclaw-user-face msg)
-
-    ;; Ensure input marker remains at start of (now empty) input box.
-    (when (and openclaw--input-start-marker
-               (marker-buffer openclaw--input-start-marker))
-      (set-marker openclaw--input-start-marker (point-max) (current-buffer)))
 
     ;; Send to gateway.
     (openclaw--make-request
