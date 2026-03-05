@@ -622,22 +622,17 @@ If URL is nil, use `openclaw-gateway-url'."
   "Convert CONTENT payload into displayable text."
   (cond
    ((stringp content) content)
+   ;; CONTENT as a single part object: ((type . "text") (text . "..."))
+   ((and (listp content)
+         (or (alist-get 'type content) (alist-get 'text content)))
+    (let ((ptext (alist-get 'text content)))
+      (if (stringp ptext) ptext "")))
+   ;; CONTENT as list of parts
+   ((listp content)
+    (mapconcat #'openclaw--content->text content "\n"))
    ((vectorp content)
-    (mapconcat
-     (lambda (part)
-       (cond
-        ((stringp part) part)
-        ((listp part)
-         (let ((ptype (alist-get 'type part))
-               (ptext (alist-get 'text part)))
-           (cond
-            ((and ptext (or (eq ptype 'text) (equal ptype "text"))) ptext)
-            ((stringp ptext) ptext)
-            (t ""))))
-        (t "")))
-     (append content nil)
-     "\n"))
-   (t (format "%s" content))))
+    (mapconcat #'openclaw--content->text (append content nil) "\n"))
+   (t "")))
 
 (defun openclaw--role-face (role)
   "Return the face for message ROLE."
