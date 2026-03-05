@@ -618,15 +618,56 @@ If URL is nil, use `openclaw-gateway-url'."
 
 ;;; Chat Functions
 
+(defun openclaw--oct-digit-p (ch)
+  "Return non-nil if CH is an octal digit character code."
+  (and (integerp ch) (>= ch ?0) (<= ch ?7)))
+
+(defun openclaw--decode-octal-escapes (s)
+  "Decode octal byte escapes in string S (e.g. \\342\\200\\231) as UTF-8."
+  (let* ((len (length s))
+         (i 0)
+         (bytes '())
+         (changed nil))
+    (while (< i len)
+      (let ((c (aref s i)))
+        (if (and (= c ?\\)
+                 (<= (+ i 3) (1- len))
+                 (openclaw--oct-digit-p (aref s (1+ i)))
+                 (openclaw--oct-digit-p (aref s (+ i 2)))
+                 (openclaw--oct-digit-p (aref s (+ i 3))))
+            (progn
+              (push (string-to-number (substring s (1+ i) (+ i 4)) 8) bytes)
+              (setq i (+ i 4)
+                    changed t))
+          (push c bytes)
+          (setq i (1+ i)))))
+    (if (not changed)
+        s
+      (condition-case nil
+          (decode-coding-string (apply #'unibyte-string (nreverse bytes)) 'utf-8 t)
+        (error s)))))
+
+(defun openclaw--normalize-text (s)
+  "Normalize string S for display."
+  (if (not (stringp s))
+      ""
+    (let ((out (openclaw--decode-octal-escapes s)))
+      (when (and (stringp out) (not (multibyte-string-p out)))
+        (setq out
+              (condition-case nil
+                  (decode-coding-string out 'utf-8 t)
+                (error out))))
+      out)))
+
 (defun openclaw--content->text (content)
   "Convert CONTENT payload into displayable text."
   (cond
-   ((stringp content) content)
+   ((stringp content) (openclaw--normalize-text content))
    ;; CONTENT as a single part object: ((type . "text") (text . "..."))
    ((and (listp content)
          (or (alist-get 'type content) (alist-get 'text content)))
     (let ((ptext (alist-get 'text content)))
-      (if (stringp ptext) ptext "")))
+      (if (stringp ptext) (openclaw--normalize-text ptext) "")))
    ;; CONTENT as list of parts
    ((listp content)
     (mapconcat #'openclaw--content->text content "\n"))
