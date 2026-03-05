@@ -46,6 +46,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'subr-x)
 (require 'websocket)
 (require 'button)
 
@@ -166,12 +167,17 @@ Used if token is not set."
 (defvar-local openclaw--message-history nil
   "List of recent messages for display (buffer-local).")
 
+(defvar-local openclaw--input-start-marker nil
+  "Marker for start of editable input area in chat buffer.")
+
+(defvar-local openclaw--input-separator-marker nil
+  "Marker for separator line before input area in chat buffer.")
+
 
 ;;; Keymaps
 
 (defvar openclaw-chat-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") #'openclaw-send-message)
     (define-key map (kbd "C-c C-c") #'openclaw-send-message)
     (define-key map (kbd "C-c C-l") #'openclaw-list-sessions)
     (define-key map (kbd "C-c C-s") #'openclaw-switch-session)
@@ -569,8 +575,10 @@ If URL is nil, use `openclaw-gateway-url'."
       (openclaw-chat-mode)
       (let ((inhibit-read-only t))
         (insert (propertize "Welcome to OpenClaw!\n" 'face 'openclaw-session-header-face))
-        (insert "Type your message and press C-c C-c to send.\n\n")))
-    (switch-to-buffer buf)))
+        (insert "Type your message in the input box and press C-c C-c to send.\n"))
+      (openclaw--insert-input-area ""))
+    (switch-to-buffer buf)
+    (goto-char (point-max))))
 
 
 ;;; Agent Management
@@ -695,6 +703,37 @@ If URL is nil, use `openclaw-gateway-url'."
       ("tool" "Tool")
       (_ (capitalize r)))))
 
+(defun openclaw--input-text ()
+  "Return current draft text from chat input area."
+  (if (and openclaw--input-start-marker
+           (marker-buffer openclaw--input-start-marker))
+      (buffer-substring-no-properties openclaw--input-start-marker (point-max))
+    ""))
+
+(defun openclaw--insert-input-area (&optional draft)
+  "Insert chat input area separator and editable box.
+Optional DRAFT pre-fills the input box."
+  (let ((separator (concat "\n" (make-string 72 ?─) "\n")))
+    (setq openclaw--input-separator-marker (copy-marker (point) t))
+    (insert separator)
+    (insert (propertize "Message (C-c C-c to send):\n" 'face 'openclaw-timestamp-face))
+    (setq openclaw--input-start-marker (copy-marker (point) t))
+    (when draft (insert draft))))
+
+(defun openclaw--insert-message-before-input (prefix prefix-face content)
+  "Insert a chat message line before input area.
+PREFIX uses PREFIX-FACE, followed by CONTENT text."
+  (let ((inhibit-read-only t)
+        (insert-pos (if (and openclaw--input-separator-marker
+                             (marker-buffer openclaw--input-separator-marker))
+                        openclaw--input-separator-marker
+                      (point-max))))
+    (save-excursion
+      (goto-char insert-pos)
+      (insert (propertize prefix 'face prefix-face))
+      (insert content)
+      (insert "\n"))))
+
 (defun openclaw--fetch-history (session-key)
   "Fetch chat history for SESSION-KEY."
   (when openclaw--handshake-complete
@@ -712,32 +751,34 @@ If URL is nil, use `openclaw-gateway-url'."
          (when target-buf
            (with-current-buffer target-buf
              (let* ((messages-raw (alist-get 'messages result))
-                    (messages (if (vectorp messages-raw)
-                                  (append messages-raw nil)
-                                messages-raw))
-                    (inhibit-read-only t))
-               (erase-buffer)
-               (when openclaw--session-label
-                 (insert (propertize (format "Session: %s\n\n"
-                                             openclaw--session-label)
-                                     'face 'openclaw-session-header-face)))
-               (if (or (not messages) (null messages))
-                   (insert "No messages yet. Press C-c C-c to send a message.\n\n")
-                 (dolist (msg messages)
-                   (let* ((role (alist-get 'role msg))
-                          (timestamp (alist-get 'timestamp msg))
-                          (content-text (openclaw--content->text
-                                        (alist-get 'content msg)))
-                          (ts-str (openclaw--format-timestamp timestamp))
-                          (role-label (openclaw--role-label role))
-                          (role-face (openclaw--role-face role)))
-                     (insert (propertize ts-str 'face 'openclaw-timestamp-face))
-                     (insert " ")
-                     (insert (propertize (format "%s: " role-label)
-                                         'face role-face))
-                     (insert content-text)
-                     (insert "\n"))))
-               (goto-char (point-max))))))))))
+                  (messages (if (vectorp messages-raw)
+                                (append messages-raw nil)
+                              messages-raw))
+                  (draft (openclaw--input-text))
+                  (inhibit-read-only t))
+             (erase-buffer)
+             (when openclaw--session-label
+               (insert (propertize (format "Session: %s\n\n"
+                                           openclaw--session-label)
+                                   'face 'openclaw-session-header-face)))
+             (if (or (not messages) (null messages))
+                 (insert "No messages yet. Press C-c C-c to send a message.\n")
+               (dolist (msg messages)
+                 (let* ((role (alist-get 'role msg))
+                        (timestamp (alist-get 'timestamp msg))
+                        (content-text (openclaw--content->text
+                                       (alist-get 'content msg)))
+                        (ts-str (openclaw--format-timestamp timestamp))
+                        (role-label (openclaw--role-label role))
+                        (role-face (openclaw--role-face role)))
+                   (insert (propertize ts-str 'face 'openclaw-timestamp-face))
+                   (insert " ")
+                   (insert (propertize (format "%s: " role-label)
+                                       'face role-face))
+                   (insert content-text)
+                   (insert "\n"))))
+             (openclaw--insert-input-area draft)
+             (goto-char (point-max))))))))))
 
 (defun openclaw--handle-chat-message (params)
   "Handle incoming chat message PARAMS."
@@ -750,39 +791,40 @@ If URL is nil, use `openclaw-gateway-url'."
       (with-current-buffer buf
         (when (and (eq major-mode 'openclaw-chat-mode)
                    (equal openclaw--current-session session-key))
-          (let ((inhibit-read-only t))
-            (goto-char (point-max))
-            (insert "\n")
-            (insert (propertize (format "%s: " role-label) 'face role-face))
-            (insert content-text)
-            (insert "\n")
-            (cl-return)))))))
+          (openclaw--insert-message-before-input
+           (format "%s: " role-label)
+           role-face
+           content-text)
+          (cl-return))))))
 
 (defun openclaw--handle-sessions-update (_params)
   "Handle sessions update notification."
   (openclaw--fetch-sessions))
 
 (defun openclaw-send-message ()
-  "Send message to current session."
+  "Send message from the chat input box (below separator)."
   (interactive)
   (unless (eq major-mode 'openclaw-chat-mode)
     (error "Not in an OpenClaw chat buffer"))
   (unless openclaw--current-session
     (error "No active session"))
+  (unless (and openclaw--input-start-marker
+               (marker-buffer openclaw--input-start-marker))
+    (error "Input box not ready yet"))
 
-  (let ((msg (read-string "Message: ")))
+  (let* ((raw (buffer-substring-no-properties openclaw--input-start-marker (point-max)))
+         (msg (string-trim raw)))
     (when (string-empty-p msg)
-      (error "Empty message"))
+      (error "Input box is empty"))
 
-    ;; Insert user message into buffer
+    ;; Clear input box first.
     (let ((inhibit-read-only t))
-      (goto-char (point-max))
-      (insert (propertize "You: " 'face 'openclaw-user-face))
-      (insert msg)
-      (insert "\n")
-      (goto-char (point-max)))
+      (delete-region openclaw--input-start-marker (point-max)))
 
-    ;; Send to gateway
+    ;; Insert user message into history area.
+    (openclaw--insert-message-before-input "You: " 'openclaw-user-face msg)
+
+    ;; Send to gateway.
     (openclaw--make-request
      "chat.send"
      `((sessionKey . ,openclaw--current-session)
@@ -794,7 +836,9 @@ If URL is nil, use `openclaw-gateway-url'."
        ;; Refresh history after brief delay
        (when openclaw--current-session
          (run-at-time 0.3 nil #'openclaw--fetch-history
-                      openclaw--current-session))))))
+                      openclaw--current-session))))
+
+    (goto-char (point-max))))
 
 (defun openclaw-show-history ()
   "Show/refresh chat history for current session."
