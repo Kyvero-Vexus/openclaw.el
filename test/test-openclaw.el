@@ -251,6 +251,13 @@
                         (openclaw--content->text "Hello world")
                         "String content passes through"))
 
+(oc-test-deftest spec-03.2-octal-escaped-unicode
+  "SPEC-03.2: Octal-escaped byte sequences decode to proper Unicode."
+  (let ((raw "Yep, I\\342\\200\\231m here \\360\\237\\221\\213 test received."))
+    (oc-test-assert-equal "Yep, I’m here 👋 test received."
+                          (openclaw--content->text raw)
+                          "Octal-escaped UTF-8 decoded correctly")))
+
 (oc-test-deftest spec-03.3-timestamp-display
   "SPEC-03.3: Timestamps displayed in messages."
   ;; We just check the format function exists and works
