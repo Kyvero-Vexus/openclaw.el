@@ -108,11 +108,14 @@ Used if token is not set."
 (defvar openclaw--sessions (make-hash-table :test 'equal)
   "Hash table of session-key to session info.")
 
-(defvar openclaw--current-session nil
-  "Currently active session key.")
+(defvar-local openclaw--current-session nil
+  "Currently active session key (buffer-local).")
 
-(defvar openclaw--message-history nil
-  "List of recent messages for display.")
+(defvar-local openclaw--session-label nil
+  "Display label for current session (buffer-local).")
+
+(defvar-local openclaw--message-history nil
+  "List of recent messages for display (buffer-local).")
 
 (defvar openclaw-mode-map
   (let ((map (make-sparse-keymap)))
@@ -165,7 +168,8 @@ Each buffer represents a single session with the assistant.
 \\{openclaw-chat-mode-map}"
   :group 'openclaw
   (buffer-disable-undo)
-  (setq-local openclaw--current-session nil))
+  (setq-local openclaw--current-session nil)
+  (setq-local openclaw--session-label nil))
 
 (defvar openclaw--connect-nonce nil
   "Nonce from gateway connect challenge.")
@@ -399,14 +403,18 @@ If URL is nil, use `openclaw-gateway-url'."
            (erase-buffer)
            (insert "OpenClaw Sessions\n")
            (insert "=================\n\n")
-           (dolist (session (alist-get 'sessions result))
-             (let* ((key (alist-get 'sessionKey session))
-                    (label (or (alist-get 'label session) key))
-                    (agent (alist-get 'agentId session)))
-               (insert-button label
-                             'action (lambda (_) (openclaw--switch-to-session key))
-                             'follow-link t)
-               (insert (format " [%s]\n" agent))))
+           (let* ((sessions-raw (alist-get 'sessions result))
+                  (sessions (if (vectorp sessions-raw) (append sessions-raw nil) sessions-raw)))
+             (dolist (session sessions)
+               (let* ((key (alist-get 'key session))
+                      (label (or (alist-get 'label session) 
+                                (alist-get 'displayName session)
+                                key))
+                      (agent (alist-get 'agentId session)))
+                 (insert-button label
+                               'action (lambda (_) (openclaw--switch-to-session key))
+                               'follow-link t)
+                 (insert (format " [%s]\n" agent)))))
            (setq buffer-read-only t)
            (goto-char (point-min))
            (display-buffer buf)))))))
@@ -414,15 +422,21 @@ If URL is nil, use `openclaw-gateway-url'."
 (defun openclaw--switch-to-session (session-key)
   "Switch to or create buffer for SESSION-KEY."
   (let* ((session-info (gethash session-key openclaw--sessions))
-         (label (or (alist-get 'label session-info) session-key))
+         (label (or (alist-get 'label session-info)
+                   (alist-get 'displayName session-info)
+                   session-key))
          (buf-name (format openclaw-session-buffer-name label))
          (buf (get-buffer-create buf-name)))
     (with-current-buffer buf
       (openclaw-chat-mode)
       (setq-local openclaw--current-session session-key)
-      (setq-local openclaw--message-history nil)
-      (openclaw--fetch-history session-key))
-    (switch-to-buffer buf)))
+      (setq-local openclaw--session-label label)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Session: %s\n" label))
+        (insert "Loading history...\n\n")))
+    (switch-to-buffer buf)
+    (openclaw--fetch-history session-key)))
 
 (defun openclaw-switch-session ()
   "Interactively switch to an OpenClaw session."
@@ -453,22 +467,32 @@ If URL is nil, use `openclaw-gateway-url'."
    `((sessionKey . ,session-key)
      (limit . 100))
    (lambda (result)
-     (let ((messages (alist-get 'messages result)))
-       (openclaw--display-messages messages)))))
-
-(defun openclaw--display-messages (messages)
-  "Display MESSAGES in current buffer."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (dolist (msg messages)
-      (let* ((role (alist-get 'role msg))
-             (content (alist-get 'content msg))
-             (timestamp (alist-get 'timestamp msg)))
-        (insert (format "[%s] %s: %s\n"
-                        (or timestamp "")
-                        (capitalize (symbol-name role))
-                        content))))
-    (goto-char (point-max))))
+     ;; Find the buffer for this session by checking buffer-local variable
+     (let ((target-buf nil))
+       (dolist (buf (buffer-list))
+         (with-current-buffer buf
+           (when (and (eq major-mode 'openclaw-chat-mode)
+                      (equal openclaw--current-session session-key))
+             (setq target-buf buf))))
+       (when target-buf
+         (with-current-buffer target-buf
+           (let* ((messages-raw (alist-get 'messages result))
+                  (messages (if (vectorp messages-raw) (append messages-raw nil) messages-raw))
+                  (inhibit-read-only t))
+             (erase-buffer)
+             (when openclaw--session-label
+               (insert (format "Session: %s\n\n" openclaw--session-label)))
+             (if (or (not messages) (null messages))
+                 (insert "No messages yet. Type your message and press C-c C-c to send.\n\n")
+               (dolist (msg messages)
+                 (let* ((role (alist-get 'role msg))
+                        (content (alist-get 'content msg))
+                        (timestamp (alist-get 'timestamp msg)))
+                   (insert (format "[%s] %s: %s\n"
+                                   (or timestamp "")
+                                   (if (symbolp role) (capitalize (symbol-name role)) role)
+                                   (or content ""))))))
+             (goto-char (point-max)))))))))
 
 (defun openclaw--handle-chat-message (params)
   "Handle incoming chat message PARAMS."
@@ -500,23 +524,25 @@ If URL is nil, use `openclaw-gateway-url'."
     (error "No active session"))
   
   ;; Get message from minibuffer
-  (let ((message (read-string "Message: ")))
-    (when (string-empty-p message)
+  (let ((msg (read-string "Message: ")))
+    (when (string-empty-p msg)
       (error "Empty message"))
+    
+    ;; Insert message into buffer immediately
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert (format "[You]: %s\n" msg))
+      (goto-char (point-max)))
     
     ;; Send to gateway
     (openclaw--make-request
      "chat.send"
      `((sessionKey . ,openclaw--current-session)
-       (message . ,message))
+       (message . ,msg))
      (lambda (result)
-       ;; Message sent, response will come via event
-       (message "Message sent")))
-    
-    ;; Show in buffer immediately
-    (let ((inhibit-read-only t))
-      (goto-char (point-max))
-      (insert (format "\n[You]: %s\n" message)))))
+       ;; Message sent successfully - response will come via event
+       (when (and (not (null result)) (alist-get 'error result))
+         (message "Send error: %s" (alist-get 'error result)))))))
 
 (defun openclaw-show-history ()
   "Show chat history for current session."
