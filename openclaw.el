@@ -189,6 +189,9 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
 (defvar-local openclaw--input-separator-marker nil
   "Marker for separator line before input area in chat buffer.")
 
+(defvar-local openclaw--run-state 'idle
+  "Current run state for this chat buffer: 'idle or 'thinking.")
+
 
 ;;; Keymaps
 
@@ -248,6 +251,7 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
   (buffer-disable-undo)
   (setq-local openclaw--current-session nil)
   (setq-local openclaw--session-label nil)
+  (setq-local openclaw--run-state 'idle)
   (openclaw--update-mode-line))
 
 
@@ -563,6 +567,7 @@ If URL is nil, use `openclaw-gateway-url'."
         (openclaw-chat-mode))
       (setq-local openclaw--current-session session-key)
       (setq-local openclaw--session-label session-key)
+      (setq-local openclaw--run-state 'idle)
       (let ((inhibit-read-only t))
         (erase-buffer)
         (insert (propertize (format "Session: %s" session-key)
@@ -742,10 +747,29 @@ For assistant messages, prefer agent name from SESSION-KEY."
 
 (defun openclaw--status-bar-text ()
   "Return status text shown in the separator bar above input box."
-  (format " %s | agent:%s | session:%s | send: RET / C-c C-c "
+  (format " %s | %s | agent:%s | session:%s | send: RET / C-c C-c "
           (if (openclaw-connected-p) "connected" "disconnected")
+          (pcase openclaw--run-state
+            ('thinking "thinking")
+            (_ "idle"))
           (or openclaw--current-agent "?")
           (or openclaw--current-session "?")))
+
+(defun openclaw--refresh-status-bar ()
+  "Refresh the status line above the input box in current chat buffer."
+  (when (and (eq major-mode 'openclaw-chat-mode)
+             openclaw--input-separator-marker
+             (marker-buffer openclaw--input-separator-marker))
+    (let ((inhibit-read-only t)
+          (status (openclaw--status-bar-text)))
+      (save-excursion
+        (goto-char openclaw--input-separator-marker)
+        (let ((beg (line-beginning-position))
+              (end (line-end-position)))
+          (delete-region beg end)
+          (goto-char beg)
+          (insert (propertize status 'face 'openclaw-status-bar-face))
+          (set-marker openclaw--input-separator-marker beg))))))
 
 (defun openclaw--insert-markdown-text (text)
   "Insert TEXT with lightweight markdown styling."
@@ -883,21 +907,30 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
                                            openclaw--session-label)
                                    'face 'openclaw-session-header-face)))
              (if (or (not messages) (null messages))
-                 (insert "No messages yet. Press C-c C-c to send a message.\n")
-               (dolist (msg messages)
-                 (let* ((role (alist-get 'role msg))
-                        (timestamp (alist-get 'timestamp msg))
-                        (content-text (openclaw--content->text
-                                       (alist-get 'content msg)))
-                        (ts-str (openclaw--format-timestamp timestamp))
-                        (role-label (openclaw--role-label role session-key))
-                        (role-face (openclaw--role-face role)))
-                   (insert (propertize ts-str 'face 'openclaw-timestamp-face))
-                   (insert " ")
-                   (insert (propertize (format "%s: " role-label)
-                                       'face role-face))
-                   (openclaw--insert-rendered-content content-text)
-                   (insert "\n"))))
+                 (progn
+                   (setq-local openclaw--run-state 'idle)
+                   (insert "No messages yet. Press C-c C-c to send a message.\n"))
+               (let ((last-role nil))
+                 (dolist (msg messages)
+                   (let* ((role (alist-get 'role msg))
+                          (timestamp (alist-get 'timestamp msg))
+                          (content-text (openclaw--content->text
+                                         (alist-get 'content msg)))
+                          (ts-str (openclaw--format-timestamp timestamp))
+                          (role-label (openclaw--role-label role session-key))
+                          (role-face (openclaw--role-face role)))
+                     (setq last-role role)
+                     (insert (propertize ts-str 'face 'openclaw-timestamp-face))
+                     (insert " ")
+                     (insert (propertize (format "%s: " role-label)
+                                         'face role-face))
+                     (openclaw--insert-rendered-content content-text)
+                     (insert "\n")))
+                 ;; Infer state from last visible role.
+                 (setq-local openclaw--run-state
+                             (if (equal (format "%s" last-role) "user")
+                                 'thinking
+                               'idle))))
              (openclaw--insert-input-area draft)
              (goto-char (point-max))))))))))
 
@@ -916,6 +949,11 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
            (format "%s: " role-label)
            role-face
            content-text)
+          (setq-local openclaw--run-state
+                      (if (equal (format "%s" role) "user")
+                          'thinking
+                        'idle))
+          (openclaw--refresh-status-bar)
           (cl-return))))))
 
 (defun openclaw--handle-sessions-update (_params)
@@ -944,6 +982,8 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
 
     ;; Insert user message into history area.
     (openclaw--insert-message-before-input "You: " 'openclaw-user-face msg)
+    (setq-local openclaw--run-state 'thinking)
+    (openclaw--refresh-status-bar)
 
     ;; Send to gateway.
     (openclaw--make-request
@@ -953,6 +993,8 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
        (idempotencyKey . ,(openclaw--idempotency-key)))
      (lambda (result)
        (when (and result (listp result) (alist-get 'error result))
+         (setq-local openclaw--run-state 'idle)
+         (openclaw--refresh-status-bar)
          (message "Send error: %s" (alist-get 'error result)))
        ;; Refresh history after brief delay
        (when openclaw--current-session
