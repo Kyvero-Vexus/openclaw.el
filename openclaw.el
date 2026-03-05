@@ -167,6 +167,12 @@ Each buffer represents a single session with the assistant.
   (buffer-disable-undo)
   (setq-local openclaw--current-session nil))
 
+(defvar openclaw--connect-nonce nil
+  "Nonce from gateway connect challenge.")
+
+(defvar openclaw--handshake-complete nil
+  "Non-nil when gateway handshake is complete.")
+
 
 ;;; WebSocket Communication
 
@@ -179,6 +185,8 @@ Each buffer represents a single session with the assistant.
 If CALLBACK is provided, it will be called with the response."
   (unless openclaw--websocket
     (error "Not connected to OpenClaw gateway"))
+  (unless openclaw--handshake-complete
+    (error "Gateway handshake not complete"))
   (let* ((id (openclaw--next-request-id))
          (request `((jsonrpc . "2.0")
                     (id . ,id)
@@ -200,38 +208,84 @@ If CALLBACK is provided, it will be called with the response."
       (remhash id openclaw--pending-requests)
       (funcall callback (or result error)))))
 
+(defun openclaw--send-connect ()
+  "Send connect frame after receiving challenge."
+  (unless openclaw--connect-nonce
+    (error "No nonce from gateway"))
+  (let* ((auth (cond
+                (openclaw-gateway-token
+                 `((token . ,openclaw-gateway-token)))
+                (openclaw-gateway-password
+                 `((password . ,openclaw-gateway-password)))
+                (t nil)))
+         (connect-frame `((connect . t)
+                          (nonce . ,openclaw--connect-nonce)
+                          (role . "operator")
+                          (platform . ,system-type)
+                          (scopes . ["operator.admin"])
+                          ,@(when auth `((auth . ,auth))))))
+    (message "Handshake complete, connected to OpenClaw!")
+    (websocket-send-text openclaw--websocket (json-encode connect-frame))
+    (setq openclaw--handshake-complete t)
+    (run-at-time 0.5 nil #'openclaw--fetch-sessions)))
+
 (defun openclaw--handle-event (event)
   "Handle an EVENT notification from the gateway."
   (let* ((data (json-read-from-string event))
-         (method (alist-get 'method data))
-         (params (alist-get 'params data)))
-    (pcase method
-      ("chat.message"
-       (openclaw--handle-chat-message params))
-      ("sessions.update"
-       (openclaw--handle-sessions-update params))
+         (event-type (alist-get 'event data))
+         (payload (alist-get 'payload data)))
+    (pcase event-type
+      ("connect.challenge"
+       (let ((nonce (alist-get 'nonce payload)))
+         (message "Received connect challenge")
+         (setq openclaw--connect-nonce nonce)
+         (openclaw--send-connect)))
       (_
-       (message "OpenClaw event: %s" method)))))
+       (let ((method (alist-get 'method data))
+             (params (alist-get 'params data)))
+         (pcase method
+           ("chat.message"
+            (openclaw--handle-chat-message params))
+           ("sessions.update"
+            (openclaw--handle-sessions-update params))
+           (_
+            (message "OpenClaw event: %s" (or event-type method)))))))))
 
 (defun openclaw--on-message (_ws frame)
   "Handle incoming WebSocket message FRAME."
   (let ((payload (websocket-frame-payload frame)))
     (condition-case err
         (let ((data (json-read-from-string payload)))
-          (if (alist-get 'method data)
-              (openclaw--handle-event payload)
-            (openclaw--handle-response payload)))
+          (cond
+           ;; Event frame (has 'event' key)
+           ((alist-get 'event data)
+            (openclaw--handle-event payload))
+           ;; JSON-RPC request (has 'method')
+           ((alist-get 'method data)
+            (openclaw--handle-event payload))
+           ;; JSON-RPC response (has 'id')
+           ((alist-get 'id data)
+            (openclaw--handle-response payload))
+           (t
+            (message "Unknown frame: %s" payload))))
       (error
        (message "OpenClaw parse error: %s" err)))))
 
 (defun openclaw--on-close (_ws)
   "Handle WebSocket close event."
-  (setq openclaw--websocket nil)
-  (message "OpenClaw connection closed"))
+  (message "OpenClaw connection closed")
+  (setq openclaw--websocket nil))
 
 (defun openclaw--on-error (_ws err)
   "Handle WebSocket error ERR."
   (message "OpenClaw connection error: %s" err))
+
+(defun openclaw--on-open (ws)
+  "Handle WebSocket open event."
+  (message "WebSocket connected, awaiting gateway challenge...")
+  (setq openclaw--websocket ws
+        openclaw--connect-nonce nil
+        openclaw--handshake-complete nil))
 
 
 ;;; Connection Management
@@ -247,25 +301,30 @@ If URL is nil, use `openclaw-gateway-url'."
   
   (message "Connecting to OpenClaw at %s..." url)
   
-  (let ((headers nil))
-    ;; Add authentication headers
+  ;; Add authentication headers
+  (let ((auth-header nil))
     (cond
      (openclaw-gateway-token
-      (push (cons "Authorization" (format "Bearer %s" openclaw-gateway-token)) headers))
+      (setq auth-header (cons "Authorization" (format "Bearer %s" openclaw-gateway-token))))
      (openclaw-gateway-password
-      (push (cons "Authorization" (format "Basic %s" (base64-encode-string 
-                                                       (format "user:%s" openclaw-gateway-password)))) headers)))
+      (setq auth-header (cons "Authorization" (format "Basic %s" (base64-encode-string 
+                                                                   (format "user:%s" openclaw-gateway-password)))))))
     
-    (websocket-open
-     url
-     :custom-header-alist headers
-     :on-open (lambda (_ws)
-                (setq openclaw--websocket _ws)
-                (message "Connected to OpenClaw")
-                (openclaw--fetch-sessions))
-     :on-message #'openclaw--on-message
-     :on-close #'openclaw--on-close
-     :on-error #'openclaw--on-error)))
+    (message "Opening websocket...")
+    (if auth-header
+        (websocket-open
+         url
+         :custom-header-alist (list auth-header)
+         :on-open #'openclaw--on-open
+         :on-message #'openclaw--on-message
+         :on-close #'openclaw--on-close
+         :on-error #'openclaw--on-error)
+      (websocket-open
+       url
+       :on-open #'openclaw--on-open
+       :on-message #'openclaw--on-message
+       :on-close #'openclaw--on-close
+       :on-error #'openclaw--on-error))))
 
 (defun openclaw-close-connection ()
   "Close the connection to OpenClaw gateway."
