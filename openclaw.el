@@ -193,6 +193,10 @@ Each buffer represents a single session with the assistant.
   "Generate the next request ID (UUID)."
   (openclaw--uuid))
 
+(defun openclaw--idempotency-key ()
+  "Generate idempotency key for chat.send requests."
+  (openclaw--uuid))
+
 (defun openclaw--make-request (method &optional params callback)
   "Send a request frame with METHOD and PARAMS.
 If CALLBACK is provided, it will be called with the response."
@@ -214,13 +218,21 @@ If CALLBACK is provided, it will be called with the response."
   "Handle a response frame from the gateway."
   (let* ((data (json-read-from-string response))
          (id (alist-get 'id data))
+         (ok (alist-get 'ok data))
          (payload (alist-get 'payload data))
-         (result (alist-get 'result payload))
-         (error (alist-get 'error payload))
-         (callback (gethash id openclaw--pending-requests)))
+         (top-error (alist-get 'error data))
+         (result (and (listp payload) (alist-get 'result payload)))
+         (payload-error (and (listp payload) (alist-get 'error payload)))
+         (callback (gethash id openclaw--pending-requests))
+         (value (cond
+                 ((and (assq 'ok data) (eq ok :json-false)) `((error . ,top-error)))
+                 (top-error `((error . ,top-error)))
+                 (payload-error `((error . ,payload-error)))
+                 (result result)
+                 (t payload))))
     (when callback
       (remhash id openclaw--pending-requests)
-      (funcall callback (or result error payload)))))
+      (funcall callback value))))
 
 (defun openclaw--send-connect ()
   "Send connect request after receiving challenge."
@@ -266,16 +278,19 @@ If CALLBACK is provided, it will be called with the response."
          (message "Received connect challenge")
          (setq openclaw--connect-nonce nonce)
          (openclaw--send-connect)))
+      ("chat"
+       ;; Gateway chat events vary by shape; safest is refresh the session history.
+       (let ((session-key (or (alist-get 'sessionKey payload)
+                              (alist-get 'session_key payload))))
+         (when (and (stringp session-key) (> (length session-key) 0))
+           (openclaw--fetch-history session-key))))
       (_
        (let ((method (alist-get 'method data))
              (params (alist-get 'params data)))
          (pcase method
-           ("chat.message"
-            (openclaw--handle-chat-message params))
-           ("sessions.update"
-            (openclaw--handle-sessions-update params))
-           (_
-            (message "OpenClaw event: %s" (or event-type method)))))))))
+           ("chat.message" (openclaw--handle-chat-message params))
+           ("sessions.update" (openclaw--handle-sessions-update params))
+           (_ nil)))))))
 
 (defun openclaw--on-message (_ws frame)
   "Handle incoming WebSocket message FRAME."
@@ -460,6 +475,27 @@ If URL is nil, use `openclaw-gateway-url'."
 
 ;;; Chat Functions
 
+(defun openclaw--content->text (content)
+  "Convert CONTENT payload into displayable text."
+  (cond
+   ((stringp content) content)
+   ((vectorp content)
+    (mapconcat
+     (lambda (part)
+       (cond
+        ((stringp part) part)
+        ((listp part)
+         (let ((ptype (alist-get 'type part))
+               (ptext (alist-get 'text part)))
+           (cond
+            ((and ptext (or (eq ptype 'text) (equal ptype "text"))) ptext)
+            ((stringp ptext) ptext)
+            (t ""))))
+        (t "")))
+     (append content nil)
+     "\n"))
+   (t (format "%s" content))))
+
 (defun openclaw--fetch-history (session-key)
   "Fetch chat history for SESSION-KEY."
   (openclaw--make-request
@@ -467,7 +503,6 @@ If URL is nil, use `openclaw-gateway-url'."
    `((sessionKey . ,session-key)
      (limit . 100))
    (lambda (result)
-     ;; Find the buffer for this session by checking buffer-local variable
      (let ((target-buf nil))
        (dolist (buf (buffer-list))
          (with-current-buffer buf
@@ -477,7 +512,9 @@ If URL is nil, use `openclaw-gateway-url'."
        (when target-buf
          (with-current-buffer target-buf
            (let* ((messages-raw (alist-get 'messages result))
-                  (messages (if (vectorp messages-raw) (append messages-raw nil) messages-raw))
+                  (messages (if (vectorp messages-raw)
+                                (append messages-raw nil)
+                              messages-raw))
                   (inhibit-read-only t))
              (erase-buffer)
              (when openclaw--session-label
@@ -485,54 +522,20 @@ If URL is nil, use `openclaw-gateway-url'."
              (if (or (not messages) (null messages))
                  (insert "No messages yet. Type your message and press C-c C-c to send.\n\n")
                (dolist (msg messages)
-                 (let* ((role (alist-get 'role msg))
-                        (content-raw (alist-get 'content msg))
-                        (timestamp (alist-get 'timestamp msg))
-                        ;; Extract text from content (can be string or vector of parts)
-                        (content-text
-                         (cond
-                          ((stringp content-raw) content-raw)
-                          ((vectorp content-raw)
-                           ;; Content is array of parts, extract text from each
-                           (mapconcat
-                            (lambda (part)
-                              (let ((part-type (alist-get 'type part))
-                                    (part-text (alist-get 'text part)))
-                                (cond
-                                 ((equal part-type 'text) (or part-text ""))
-                                 ((stringp part) part)
-                                 (t ""))))
-                            (append content-raw nil)
-                            "\n"))
-                          (t (format "%s" content-raw)))))
+                 (let ((role (alist-get 'role msg))
+                       (timestamp (alist-get 'timestamp msg))
+                       (content-text (openclaw--content->text (alist-get 'content msg))))
                    (insert (format "[%s] %s: %s\n"
                                    (or timestamp "")
                                    (if (symbolp role) (capitalize (symbol-name role)) role)
-                                   content-text))))
+                                   content-text)))))
              (goto-char (point-max)))))))))
 
 (defun openclaw--handle-chat-message (params)
   "Handle incoming chat message PARAMS."
   (let* ((session-key (alist-get 'sessionKey params))
          (role (alist-get 'role params))
-         (content-raw (alist-get 'content params))
-         ;; Extract text from content
-         (content-text
-          (cond
-           ((stringp content-raw) content-raw)
-           ((vectorp content-raw)
-            (mapconcat
-             (lambda (part)
-               (let ((part-type (alist-get 'type part))
-                     (part-text (alist-get 'text part)))
-                 (cond
-                  ((equal part-type 'text) (or part-text ""))
-                  ((stringp part) part)
-                  (t ""))))
-             (append content-raw nil)
-             "\n"))
-           (t (format "%s" content-raw)))))
-    ;; Find buffer for this session and append message
+         (content-text (openclaw--content->text (alist-get 'content params))))
     (cl-dolist (buf (buffer-list))
       (with-current-buffer buf
         (when (and (eq major-mode 'openclaw-chat-mode)
@@ -571,9 +574,11 @@ If URL is nil, use `openclaw-gateway-url'."
     (openclaw--make-request
      "chat.send"
      `((sessionKey . ,openclaw--current-session)
-       (message . ,msg))
+       (message . ,msg)
+       (idempotencyKey . ,(openclaw--idempotency-key)))
      (lambda (result)
-       ;; Message sent successfully - response will come via event
+       ;; Refresh history after send ack so the buffer reflects persisted state.
+       (run-at-time 0.3 nil #'openclaw--fetch-history openclaw--current-session)
        (when (and (not (null result)) (alist-get 'error result))
          (message "Send error: %s" (alist-get 'error result)))))))
 
@@ -594,8 +599,9 @@ If URL is nil, use `openclaw-gateway-url'."
   (openclaw--make-request
    "chat.send"
    `((sessionKey . ,openclaw--current-session)
-     (message . ,cmd))
-   (lambda (result)
+     (message . ,cmd)
+     (idempotencyKey . ,(openclaw--idempotency-key)))
+   (lambda (_result)
      (message "Command sent: %s" cmd))))
 
 
