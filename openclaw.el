@@ -173,22 +173,31 @@ Each buffer represents a single session with the assistant.
 (defvar openclaw--handshake-complete nil
   "Non-nil when gateway handshake is complete.")
 
+(defun openclaw--uuid ()
+  "Generate a random UUID string."
+  (format "%04x%04x-%04x-%04x-%04x-%04x%04x%04x"
+          (random 65535) (random 65535)
+          (random 65535)
+          (logior 8192 (random 4096))  ; version 4
+          (logior 49152 (random 16384)) ; variant
+          (random 65535) (random 65535) (random 65535)))
+
 
 ;;; WebSocket Communication
 
 (defun openclaw--next-request-id ()
-  "Generate the next request ID."
-  (cl-incf openclaw--request-id))
+  "Generate the next request ID (UUID)."
+  (openclaw--uuid))
 
 (defun openclaw--make-request (method &optional params callback)
-  "Send a JSON-RPC request with METHOD and PARAMS.
+  "Send a request frame with METHOD and PARAMS.
 If CALLBACK is provided, it will be called with the response."
   (unless openclaw--websocket
     (error "Not connected to OpenClaw gateway"))
   (unless openclaw--handshake-complete
     (error "Gateway handshake not complete"))
   (let* ((id (openclaw--next-request-id))
-         (request `((jsonrpc . "2.0")
+         (request `((type . "req")
                     (id . ,id)
                     (method . ,method)
                     ,@(when params `((params . ,params))))))
@@ -198,18 +207,19 @@ If CALLBACK is provided, it will be called with the response."
     id))
 
 (defun openclaw--handle-response (response)
-  "Handle a JSON-RPC RESPONSE from the gateway."
+  "Handle a response frame from the gateway."
   (let* ((data (json-read-from-string response))
          (id (alist-get 'id data))
-         (result (alist-get 'result data))
-         (error (alist-get 'error data))
+         (payload (alist-get 'payload data))
+         (result (alist-get 'result payload))
+         (error (alist-get 'error payload))
          (callback (gethash id openclaw--pending-requests)))
     (when callback
       (remhash id openclaw--pending-requests)
-      (funcall callback (or result error)))))
+      (funcall callback (or result error payload)))))
 
 (defun openclaw--send-connect ()
-  "Send connect frame after receiving challenge."
+  "Send connect request after receiving challenge."
   (unless openclaw--connect-nonce
     (error "No nonce from gateway"))
   (let* ((auth (cond
@@ -218,16 +228,28 @@ If CALLBACK is provided, it will be called with the response."
                 (openclaw-gateway-password
                  `((password . ,openclaw-gateway-password)))
                 (t nil)))
-         (connect-frame `((connect . t)
-                          (nonce . ,openclaw--connect-nonce)
-                          (role . "operator")
-                          (platform . ,system-type)
-                          (scopes . ["operator.admin"])
-                          ,@(when auth `((auth . ,auth))))))
-    (message "Handshake complete, connected to OpenClaw!")
-    (websocket-send-text openclaw--websocket (json-encode connect-frame))
-    (setq openclaw--handshake-complete t)
-    (run-at-time 0.5 nil #'openclaw--fetch-sessions)))
+         (id (openclaw--uuid))
+         (params `((minProtocol . 3)
+                   (maxProtocol . 3)
+                   (client . ((id . "gateway-client")
+                              (displayName . "openclaw.el")
+                              (version . "0.1.0")
+                              (platform . ,system-type)
+                              (mode . "backend")))
+                   (caps . [])
+                   (role . "operator")
+                   (scopes . ["operator.admin"])
+                   ,@(when auth `((auth . ,auth)))))
+         (connect-frame `((type . "req")
+                          (id . ,id)
+                          (method . "connect")
+                          (params . ,params))))
+    (puthash id (lambda (result)
+                  (message "Connected to OpenClaw!")
+                  (setq openclaw--handshake-complete t)
+                  (openclaw--fetch-sessions))
+            openclaw--pending-requests)
+    (websocket-send-text openclaw--websocket (json-encode connect-frame))))
 
 (defun openclaw--handle-event (event)
   "Handle an EVENT notification from the gateway."
@@ -260,14 +282,15 @@ If CALLBACK is provided, it will be called with the response."
            ;; Event frame (has 'event' key)
            ((alist-get 'event data)
             (openclaw--handle-event payload))
-           ;; JSON-RPC request (has 'method')
+           ;; Response frame (has 'type' = "res" or has 'payload')
+           ((or (equal (alist-get 'type data) "res")
+                (alist-get 'payload data))
+            (openclaw--handle-response payload))
+           ;; Request frame (has 'method') - events without 'event' key
            ((alist-get 'method data)
             (openclaw--handle-event payload))
-           ;; JSON-RPC response (has 'id')
-           ((alist-get 'id data)
-            (openclaw--handle-response payload))
            (t
-            (message "Unknown frame: %s" payload))))
+            nil)))  ; Ignore unknown frames
       (error
        (message "OpenClaw parse error: %s" err)))))
 
@@ -350,10 +373,16 @@ If URL is nil, use `openclaw-gateway-url'."
      '((limit . 50))
      (lambda (result)
        (clrhash openclaw--sessions)
-       (dolist (session (alist-get 'sessions result))
-         (let ((key (alist-get 'sessionKey session)))
-           (puthash key session openclaw--sessions)))
-       (message "Loaded %d sessions" (hash-table-count openclaw--sessions))))))
+       ;; Result is an alist with 'sessions' key containing a vector
+       (let* ((sessions-raw (alist-get 'sessions result))
+              (sessions (if (vectorp sessions-raw)
+                            (append sessions-raw nil)
+                          (list sessions-raw))))
+         (dolist (session sessions)
+           (let ((key (alist-get 'key session)))
+             (when key
+               (puthash key session openclaw--sessions))))
+         (message "Loaded %d OpenClaw sessions" (hash-table-count openclaw--sessions)))))))
 
 (defun openclaw-list-sessions ()
   "Display list of OpenClaw sessions."
