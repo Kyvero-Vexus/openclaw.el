@@ -394,22 +394,26 @@ EVENT is the raw JSON string."
   "Handle incoming WebSocket message FRAME."
   (let ((payload (websocket-frame-payload frame)))
     (when (and payload (stringp payload) (> (length payload) 0))
-      (condition-case err
-          (let ((data (json-read-from-string payload)))
-            (cond
-             ;; Event frame (has 'event' key)
-             ((alist-get 'event data)
-              (openclaw--handle-event payload))
-             ;; Response frame
-             ((or (equal (alist-get 'type data) "res")
-                  (alist-get 'payload data))
-              (openclaw--handle-response payload))
-             ;; Request frame (method-based events)
-             ((alist-get 'method data)
-              (openclaw--handle-event payload))
-             (t nil)))
-        (error
-         (message "OpenClaw parse error: %s" err))))))
+      ;; Some gateway/tooling paths can emit non-JSON text frames. Ignore those.
+      (if (not (string-match-p "\\`[[:space:]]*[\\[{]" payload))
+          nil
+        (condition-case err
+            (let ((data (json-read-from-string payload)))
+              (cond
+               ;; Event frame (has 'event' key)
+               ((alist-get 'event data)
+                (openclaw--handle-event payload))
+               ;; Response frame
+               ((or (equal (alist-get 'type data) "res")
+                    (alist-get 'payload data))
+                (openclaw--handle-response payload))
+               ;; Request frame (method-based events)
+               ((alist-get 'method data)
+                (openclaw--handle-event payload))
+               (t nil)))
+          (json-readtable-error nil)
+          (error
+           (message "OpenClaw parse error: %s" err)))))))
 
 (defun openclaw--on-close (_ws)
   "Handle WebSocket close event."
