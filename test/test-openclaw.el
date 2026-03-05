@@ -521,12 +521,44 @@
       (openclaw-chat-mode)
       (setq-local openclaw--current-session "agent:ceo_chryso:main")
       (setq openclaw--current-agent "ceo_chryso")
+      (setq-local openclaw--run-state 'idle)
       (openclaw--insert-input-area "")
       (let ((txt (buffer-string)))
         (oc-test-assert-match "connected" txt "Status bar shows connection")
+        (oc-test-assert-match "idle" txt "Status bar shows idle state")
         (oc-test-assert-match "agent:ceo_chryso" txt "Status bar shows agent")
         (oc-test-assert-match "session:agent:ceo_chryso:main" txt
                               "Status bar shows current session")))))
+
+(oc-test-deftest spec-06.7b-status-bar-thinking-idle-transition
+  "SPEC-06.7b: Status bar shows thinking after send, idle after assistant reply."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect)
+        (oc-mock--complete-handshake)
+        (setq oc-mock--sent-frames nil)
+        (with-temp-buffer
+          (openclaw-chat-mode)
+          (setq-local openclaw--current-session "agent:ceo_chryso:main")
+          (setq openclaw--current-agent "ceo_chryso")
+          (openclaw--insert-input-area "")
+          (goto-char (point-max))
+          (insert "test")
+          (openclaw-send-message)
+          (oc-test-assert-equal 'thinking openclaw--run-state
+                                "Run state set to thinking after send")
+          (oc-test-assert-match "thinking" (buffer-string)
+                                "Status bar text shows thinking")
+          (openclaw--handle-chat-message
+           '((sessionKey . "agent:ceo_chryso:main")
+             (role . "assistant")
+             (content . "done")))
+          (oc-test-assert-equal 'idle openclaw--run-state
+                                "Run state set to idle on assistant message")
+          (oc-test-assert-match "idle" (buffer-string)
+                                "Status bar text shows idle")))
+    (oc-mock--uninstall)))
 
 (oc-test-deftest spec-06.8-heartbeat-does-not-break-chat
   "SPEC-06.8: Heartbeat rendering does not break subsequent sending."
