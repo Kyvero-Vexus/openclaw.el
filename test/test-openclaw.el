@@ -424,6 +424,38 @@
                                     "Slash prepended when missing")))))
     (oc-mock--uninstall)))
 
+(oc-test-deftest spec-06.5-input-box-send-not-empty
+  "SPEC-06.5: Text typed in input box is sent (not treated as empty)."
+  (oc-mock--install)
+  (unwind-protect
+      (progn
+        (let ((openclaw-gateway-token "tok"))
+          (openclaw-connect)
+          (oc-mock--complete-handshake)
+          (setq oc-mock--sent-frames nil)
+          (with-temp-buffer
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "test-sess")
+            (openclaw--insert-input-area "")
+            (goto-char (point-max))
+            (insert "test")
+            (openclaw-send-message)
+            (let* ((sent (oc-mock--last-sent-parsed))
+                   (params (alist-get 'params sent)))
+              (oc-test-assert-equal "chat.send" (alist-get 'method sent)
+                                    "chat.send request emitted")
+              (oc-test-assert-equal "test" (alist-get 'message params)
+                                    "Typed input text sent")
+              (oc-test-assert-equal "" (openclaw--input-text)
+                                    "Input box cleared after send")))))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-06.6-ret-bound-to-send
+  "SPEC-06.6: RET in chat mode is bound to send from input box."
+  (oc-test-assert-equal #'openclaw-send-message
+                        (lookup-key openclaw-chat-mode-map (kbd "RET"))
+                        "RET sends current input box"))
+
 ;;; ============================================================
 ;;; SPEC-07: Mode Line
 ;;; ============================================================
