@@ -178,6 +178,7 @@ Used if token is not set."
 
 (defvar openclaw-chat-mode-map
   (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'openclaw-send-message)
     (define-key map (kbd "C-c C-c") #'openclaw-send-message)
     (define-key map (kbd "C-c C-l") #'openclaw-list-sessions)
     (define-key map (kbd "C-c C-s") #'openclaw-switch-session)
@@ -717,7 +718,8 @@ Optional DRAFT pre-fills the input box."
     (setq openclaw--input-separator-marker (copy-marker (point) t))
     (insert separator)
     (insert (propertize "Message (C-c C-c to send):\n" 'face 'openclaw-timestamp-face))
-    (setq openclaw--input-start-marker (copy-marker (point) t))
+    ;; Keep marker at beginning of input area as user types.
+    (setq openclaw--input-start-marker (copy-marker (point) nil))
     (when draft (insert draft))))
 
 (defun openclaw--insert-message-before-input (prefix prefix-face content)
@@ -823,6 +825,11 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
 
     ;; Insert user message into history area.
     (openclaw--insert-message-before-input "You: " 'openclaw-user-face msg)
+
+    ;; Ensure input marker remains at start of (now empty) input box.
+    (when (and openclaw--input-start-marker
+               (marker-buffer openclaw--input-start-marker))
+      (set-marker openclaw--input-start-marker (point-max) (current-buffer)))
 
     ;; Send to gateway.
     (openclaw--make-request
