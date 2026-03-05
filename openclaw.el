@@ -258,14 +258,14 @@ If URL is nil, use `openclaw-gateway-url'."
     
     (websocket-open
      url
-     :custom headers
+     :custom-header-alist headers
+     :on-open (lambda (_ws)
+                (setq openclaw--websocket _ws)
+                (message "Connected to OpenClaw")
+                (openclaw--fetch-sessions))
      :on-message #'openclaw--on-message
      :on-close #'openclaw--on-close
-     :on-error #'openclaw--on-error
-     (lambda (ws)
-       (setq openclaw--websocket ws)
-       (message "Connected to OpenClaw")
-       (openclaw--fetch-sessions)))))
+     :on-error #'openclaw--on-error)))
 
 (defun openclaw-close-connection ()
   "Close the connection to OpenClaw gateway."
