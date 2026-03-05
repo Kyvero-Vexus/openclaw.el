@@ -486,19 +486,52 @@ If URL is nil, use `openclaw-gateway-url'."
                  (insert "No messages yet. Type your message and press C-c C-c to send.\n\n")
                (dolist (msg messages)
                  (let* ((role (alist-get 'role msg))
-                        (content (alist-get 'content msg))
-                        (timestamp (alist-get 'timestamp msg)))
+                        (content-raw (alist-get 'content msg))
+                        (timestamp (alist-get 'timestamp msg))
+                        ;; Extract text from content (can be string or vector of parts)
+                        (content-text
+                         (cond
+                          ((stringp content-raw) content-raw)
+                          ((vectorp content-raw)
+                           ;; Content is array of parts, extract text from each
+                           (mapconcat
+                            (lambda (part)
+                              (let ((part-type (alist-get 'type part))
+                                    (part-text (alist-get 'text part)))
+                                (cond
+                                 ((equal part-type 'text) (or part-text ""))
+                                 ((stringp part) part)
+                                 (t ""))))
+                            (append content-raw nil)
+                            "\n"))
+                          (t (format "%s" content-raw)))))
                    (insert (format "[%s] %s: %s\n"
                                    (or timestamp "")
                                    (if (symbolp role) (capitalize (symbol-name role)) role)
-                                   (or content ""))))))
+                                   content-text))))
              (goto-char (point-max)))))))))
 
 (defun openclaw--handle-chat-message (params)
   "Handle incoming chat message PARAMS."
   (let* ((session-key (alist-get 'sessionKey params))
          (role (alist-get 'role params))
-         (content (alist-get 'content params)))
+         (content-raw (alist-get 'content params))
+         ;; Extract text from content
+         (content-text
+          (cond
+           ((stringp content-raw) content-raw)
+           ((vectorp content-raw)
+            (mapconcat
+             (lambda (part)
+               (let ((part-type (alist-get 'type part))
+                     (part-text (alist-get 'text part)))
+                 (cond
+                  ((equal part-type 'text) (or part-text ""))
+                  ((stringp part) part)
+                  (t ""))))
+             (append content-raw nil)
+             "\n"))
+           (t (format "%s" content-raw)))))
     ;; Find buffer for this session and append message
     (cl-dolist (buf (buffer-list))
       (with-current-buffer buf
@@ -507,8 +540,8 @@ If URL is nil, use `openclaw-gateway-url'."
           (let ((inhibit-read-only t))
             (goto-char (point-max))
             (insert (format "\n[%s]: %s\n"
-                            (capitalize (symbol-name role))
-                            content))
+                            (if (symbolp role) (capitalize (symbol-name role)) role)
+                            content-text))
             (cl-return)))))))
 
 (defun openclaw--handle-sessions-update (params)
