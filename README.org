@@ -1,0 +1,144 @@
+#+title: openclaw.el
+#+description: Emacs interface to OpenClaw
+#+options: toc:2
+
+* Overview
+
+=openclaw.el= is an Emacs package that provides a complete interface to [[https://github.com/openclaw/openclaw][OpenClaw]], your personal AI assistant.
+
+Each OpenClaw session becomes its own Emacs buffer, and you get:
+- Leader-key based keybindings for all slash commands
+- Direct slash command support for those who prefer it
+- Full feature parity with the OpenClaw TUI
+- Multiple simultaneous sessions in separate buffers
+
+* Installation
+
+** From MELPA (coming soon)
+
+#+begin_src elisp
+(use-package openclaw
+  :ensure t)
+#+end_src
+
+** Manual installation
+
+Clone this repository and add to your =load-path=:
+
+#+begin_src elisp
+(add-to-list 'load-path "/path/to/openclaw.el")
+(require 'openclaw)
+#+end_src
+
+** Dependencies
+
+- Emacs 27.1 or later
+- [[https://github.com/ahyatt/emacs-websocket][websocket]] package (for WebSocket communication)
+
+* Quick Start
+
+1. Connect to your OpenClaw gateway:
+
+   #+begin_src elisp
+   M-x openclaw-connect RET
+   #+end_src
+
+2. Start chatting:
+
+   #+begin_src elisp
+   M-x openclaw-chat RET
+   #+end_src
+
+3. Type your message and press =C-c C-c= to send.
+
+* Configuration
+
+** Gateway settings
+
+#+begin_src elisp
+(setq openclaw-gateway-url "ws://127.0.0.1:18789"
+      openclaw-gateway-token "your-token-here")
+#+end_src
+
+** Leader key
+
+By default, leader-style commands are accessible under =C-c= in =openclaw-mode=:
+
+#+begin_src elisp
+(setq openclaw-leader-key "C-c")  ; default
+#+end_src
+
+* Keybindings
+
+** Chat mode (=openclaw-chat-mode=)
+
+| Key     | Command                    |
+|---------+----------------------------|
+| =RET=     | Send message               |
+| =C-c C-c= | Send message               |
+| =C-c C-l= | List sessions              |
+| =C-c C-s= | Switch session             |
+| =C-c C-n= | New chat                   |
+| =C-c C-h= | Show history               |
+| =C-c C-q= | Close connection           |
+
+** Leader keys
+
+In =openclaw-mode=, single-letter commands are available:
+
+| Key | Command             |
+|-----+---------------------|
+| =c=   | Connect             |
+| =C=   | Close connection    |
+| =l=   | List sessions       |
+| =s=   | Switch session      |
+| =n=   | New chat            |
+| =m=   | Send message        |
+| =h=   | Show history        |
+| =?=   | Help                |
+
+* Slash Commands
+
+You can still use OpenClaw slash commands directly by typing them in the chat buffer:
+
+- =/status= - Show session status
+- =/clear= - Clear chat history
+- =/model= - Change model
+- =/help= - Show gateway help
+
+* Gateway Protocol
+
+=openclaw.el= communicates with the OpenClaw gateway via JSON-RPC over WebSocket:
+
+- Default URL: =ws://127.0.0.1:18789=
+- Protocol: JSON-RPC 2.0
+- Methods used:
+  - =sessions.list= - List available sessions
+  - =chat.send= - Send a message
+  - =chat.history= - Fetch message history
+
+See the [[https://docs.openclaw.ai/gateway][OpenClaw Gateway documentation]] for more details.
+
+* Development
+
+** Running tests
+
+#+begin_src bash
+make test
+#+end_src
+
+** Byte compilation check
+
+#+begin_src bash
+make compile
+#+end_src
+
+* License
+
+GNU Affero General Public License v3.0 or later. See [[file:LICENSE][LICENSE]] for details.
+
+* Links
+
+- [[https://github.com/Kyvero-Vexus/openclaw.el][GitHub Repository]]
+- [[https://openclaw.ai][OpenClaw Website]]
+- [[https://docs.openclaw.ai][OpenClaw Documentation]]
