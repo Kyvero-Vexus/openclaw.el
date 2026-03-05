@@ -1,0 +1,16 @@
+# Emacs
+*.elc
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.auto-save-list
+/auto-save-list
+
+# Package build
+*.tar
+*.pkg.el
+
+# Development
+/.dir-locals.el
+/test/*.elc
