@@ -210,6 +210,12 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
 (defvar openclaw--reconnect-url nil
   "URL used for the last connection (used by auto-reconnect).")
 
+(defvar openclaw--keepalive-timer nil
+  "Timer for periodic keepalive pings.")
+
+(defvar openclaw--keepalive-interval nil
+  "Keepalive interval in seconds, derived from gateway tickIntervalMs.")
+
 (defcustom openclaw-auto-reconnect t
   "Whether to automatically reconnect on dropped connections."
   :type 'boolean
@@ -228,6 +234,12 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
 (defcustom openclaw-reconnect-max-delay 60.0
   "Maximum delay in seconds for reconnection backoff."
   :type 'float
+  :group 'openclaw)
+
+(defcustom openclaw-keepalive t
+  "Whether to send periodic keepalive pings during idle periods.
+Uses the tickIntervalMs from the gateway handshake to determine interval."
+  :type 'boolean
   :group 'openclaw)
 
 
@@ -423,9 +435,15 @@ RESPONSE is the raw JSON string."
                           (id . ,id)
                           (method . "connect")
                           (params . ,params))))
-    (puthash id (lambda (_result)
+    (puthash id (lambda (result)
                   (setq openclaw--handshake-complete t)
                   (message "Connected to OpenClaw gateway!")
+                  ;; Extract tickIntervalMs for keepalive
+                  (let* ((policy (and (listp result) (alist-get 'policy result)))
+                         (tick-ms (and (listp policy) (alist-get 'tickIntervalMs policy))))
+                    (when (and tick-ms (numberp tick-ms) (> tick-ms 0))
+                      (setq openclaw--keepalive-interval (/ tick-ms 1000.0))
+                      (openclaw--start-keepalive)))
                   (openclaw--update-mode-line)
                   (openclaw--fetch-sessions))
             openclaw--pending-requests)
@@ -514,9 +532,73 @@ EVENT is the raw JSON string."
      (message "OpenClaw: reconnect failed: %s" err)
      (openclaw--schedule-reconnect))))
 
+(defun openclaw--reset-all-streaming-state ()
+  "Reset stale streaming state in all chat buffers.
+Called on disconnect or reconnect to prevent stale markers/text
+from corrupting the display after a mid-stream connection drop."
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and (eq major-mode 'openclaw-chat-mode)
+                 (or (not (string-empty-p (or openclaw--streaming-text "")))
+                     openclaw--streaming-marker))
+        (let ((inhibit-read-only t))
+          ;; If we were mid-stream, add a truncation notice
+          (when (and openclaw--streaming-marker
+                     (marker-buffer openclaw--streaming-marker))
+            (save-excursion
+              (goto-char openclaw--streaming-marker)
+              (insert (propertize " [interrupted]" 'face 'openclaw-system-face))
+              (insert "\n")
+              ;; Advance separator marker past the interrupted text
+              (when (and openclaw--input-separator-marker
+                         (marker-buffer openclaw--input-separator-marker))
+                (set-marker openclaw--input-separator-marker (point)))))
+          ;; Clean up streaming state
+          (when openclaw--streaming-marker
+            (set-marker openclaw--streaming-marker nil))
+          (setq-local openclaw--streaming-marker nil)
+          (setq-local openclaw--streaming-text "")
+          (setq-local openclaw--run-state 'idle)
+          (openclaw--refresh-status-bar))))))
+
+(defun openclaw--cancel-keepalive ()
+  "Cancel the keepalive timer if running."
+  (when openclaw--keepalive-timer
+    (cancel-timer openclaw--keepalive-timer)
+    (setq openclaw--keepalive-timer nil)))
+
+(defun openclaw--start-keepalive ()
+  "Start periodic keepalive pings if enabled and interval is known."
+  (openclaw--cancel-keepalive)
+  (when (and openclaw-keepalive
+             openclaw--keepalive-interval
+             (> openclaw--keepalive-interval 0))
+    (setq openclaw--keepalive-timer
+          (run-at-time openclaw--keepalive-interval
+                       openclaw--keepalive-interval
+                       #'openclaw--send-keepalive))))
+
+(defun openclaw--send-keepalive ()
+  "Send a lightweight ping to the gateway to keep the connection alive."
+  (when (and openclaw--websocket
+             openclaw--handshake-complete
+             (openclaw-connected-p))
+    (condition-case nil
+        (websocket-send-text
+         openclaw--websocket
+         (json-encode `((type . "req")
+                        (id . ,(openclaw--uuid))
+                        (method . "ping"))))
+      (error
+       ;; Connection probably died; cancel keepalive, let reconnect handle it
+       (openclaw--cancel-keepalive)))))
+
 (defun openclaw--on-close (_ws)
   "Handle WebSocket close event."
   (message "OpenClaw connection closed")
+  ;; Reset streaming state in all buffers before clearing connection
+  (openclaw--reset-all-streaming-state)
+  (openclaw--cancel-keepalive)
   (setq openclaw--websocket nil
         openclaw--handshake-complete nil)
   (openclaw--update-mode-line)
@@ -533,7 +615,9 @@ EVENT is the raw JSON string."
         openclaw--connect-nonce nil
         openclaw--handshake-complete nil
         openclaw--reconnect-attempts 0)
-  (openclaw--cancel-reconnect))
+  (openclaw--cancel-reconnect)
+  ;; Reset any stale streaming state from prior connection
+  (openclaw--reset-all-streaming-state))
 
 
 ;;; Connection Management
@@ -563,6 +647,8 @@ If URL is nil, use `openclaw-gateway-url'."
   "Close the connection to OpenClaw gateway."
   (interactive)
   (openclaw--cancel-reconnect)
+  (openclaw--cancel-keepalive)
+  (openclaw--reset-all-streaming-state)
   (setq openclaw--reconnect-url nil)  ; prevent auto-reconnect on explicit close
   (when openclaw--websocket
     (websocket-close openclaw--websocket)
@@ -1084,21 +1170,30 @@ when no state field is present (legacy events)."
             (openclaw--refresh-status-bar)
             (let ((insert-pos (if (and openclaw--input-separator-marker
                                        (marker-buffer openclaw--input-separator-marker))
-                                  openclaw--input-separator-marker
+                                  (marker-position openclaw--input-separator-marker)
                                 (point-max)))
                   (role-label (openclaw--role-label "assistant" session-key)))
               (save-excursion
                 (goto-char insert-pos)
                 (insert (propertize (format "%s: " role-label)
                                    'face 'openclaw-assistant-face))
-                (setq-local openclaw--streaming-marker (copy-marker (point) t)))))
+                (setq-local openclaw--streaming-marker (copy-marker (point) t))
+                ;; Advance separator marker past the role label so
+                ;; status bar refresh doesn't clobber streaming content
+                (when (and openclaw--input-separator-marker
+                           (marker-buffer openclaw--input-separator-marker))
+                  (set-marker openclaw--input-separator-marker (point))))))
           ;; Append the delta text at the streaming marker
           (when (and openclaw--streaming-marker
                      (marker-buffer openclaw--streaming-marker))
             (save-excursion
               (goto-char openclaw--streaming-marker)
               (insert (openclaw--normalize-text text))
-              (set-marker openclaw--streaming-marker (point))))
+              (set-marker openclaw--streaming-marker (point))
+              ;; Keep separator marker past all streaming content
+              (when (and openclaw--input-separator-marker
+                         (marker-buffer openclaw--input-separator-marker))
+                (set-marker openclaw--input-separator-marker (point)))))
           (setq-local openclaw--streaming-text
                       (concat (or openclaw--streaming-text "") text)))
         (cl-return)))))

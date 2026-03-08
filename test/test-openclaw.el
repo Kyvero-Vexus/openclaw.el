@@ -947,6 +947,238 @@
     (oc-mock--uninstall)))
 
 ;;; ============================================================
+;;; SPEC-12: Streaming State Reset on Disconnect/Reconnect
+;;; ============================================================
+
+(oc-test-deftest spec-12.1-disconnect-mid-stream-resets-state
+  "SPEC-12.1: Disconnect mid-stream resets streaming state and marks interrupted."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*mid-stream-dc*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "dc-sess")
+            (openclaw--insert-input-area ""))
+          ;; Start streaming
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "dc-sess")
+                                      (state . "delta")
+                                      (delta . "partial response"))))))
+          ;; Verify mid-stream state
+          (with-current-buffer buf
+            (oc-test-assert-equal 'thinking openclaw--run-state
+                                  "State is thinking during stream")
+            (oc-test-assert-nonnil openclaw--streaming-marker
+                                   "Streaming marker set during stream"))
+          ;; Simulate connection drop
+          (openclaw--on-close nil)
+          ;; Verify state reset
+          (with-current-buffer buf
+            (oc-test-assert-equal 'idle openclaw--run-state
+                                  "State reset to idle after disconnect")
+            (oc-test-assert-nil openclaw--streaming-marker
+                                "Streaming marker cleared after disconnect")
+            (oc-test-assert-equal "" openclaw--streaming-text
+                                  "Streaming text cleared after disconnect")
+            (oc-test-assert-match "interrupted" (buffer-string)
+                                  "Interrupted notice shown in buffer"))
+          (kill-buffer buf)))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-12.2-reconnect-resets-stale-streaming
+  "SPEC-12.2: Reconnect after mid-stream drop resets streaming state."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*reconnect-stream*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "rc-sess")
+            (openclaw--insert-input-area ""))
+          ;; Start streaming
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "rc-sess")
+                                      (state . "delta")
+                                      (delta . "in progress"))))))
+          ;; Reconnect (on-open resets streaming state)
+          (openclaw-connect "ws://127.0.0.1:18789")
+          (with-current-buffer buf
+            (oc-test-assert-equal 'idle openclaw--run-state
+                                  "State is idle after reconnect")
+            (oc-test-assert-nil openclaw--streaming-marker
+                                "Streaming marker nil after reconnect")
+            (oc-test-assert-equal "" openclaw--streaming-text
+                                  "Streaming text empty after reconnect"))
+          (kill-buffer buf)))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-12.3-clean-buffer-unaffected-by-reset
+  "SPEC-12.3: Buffers not streaming are unaffected by streaming reset."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*clean-buf*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "clean-sess")
+            (openclaw--insert-input-area "")
+            (let ((content-before (buffer-string)))
+              ;; Trigger reset
+              (openclaw--reset-all-streaming-state)
+              (oc-test-assert-equal content-before (buffer-string)
+                                    "Clean buffer content unchanged after reset")
+              (oc-test-assert-equal 'idle openclaw--run-state
+                                    "Clean buffer stays idle")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-12.4-send-after-interrupted-stream
+  "SPEC-12.4: Can send new message after stream was interrupted by disconnect."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*send-after-dc*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "send-dc-sess")
+            (openclaw--insert-input-area ""))
+          ;; Stream then disconnect
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "send-dc-sess")
+                                      (state . "delta")
+                                      (delta . "partial"))))))
+          (openclaw--on-close nil)
+          ;; Reconnect
+          (openclaw-connect "ws://127.0.0.1:18789")
+          (oc-mock--complete-handshake)
+          (setq oc-mock--sent-frames nil)
+          ;; Send message
+          (with-current-buffer buf
+            (goto-char (point-max))
+            (insert "retry message")
+            (openclaw-send-message)
+            (let* ((sent (oc-mock--last-sent-parsed))
+                   (params (alist-get 'params sent)))
+              (oc-test-assert-equal "chat.send" (alist-get 'method sent)
+                                    "chat.send works after interrupted stream")
+              (oc-test-assert-equal "retry message" (alist-get 'message params)
+                                    "Message text correct after interrupted stream")))
+          (kill-buffer buf)))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+;;; ============================================================
+;;; SPEC-13: Keepalive / Heartbeat Pings
+;;; ============================================================
+
+(oc-test-deftest spec-13.1-keepalive-customization-exists
+  "SPEC-13.1: Keepalive customization variable exists and defaults to t."
+  (oc-test-assert-nonnil (boundp 'openclaw-keepalive)
+                         "openclaw-keepalive variable exists")
+  (oc-test-assert-equal t (default-value 'openclaw-keepalive)
+                        "openclaw-keepalive defaults to t"))
+
+(oc-test-deftest spec-13.2-keepalive-extracts-tick-interval
+  "SPEC-13.2: Handshake extracts tickIntervalMs for keepalive interval."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-keepalive t)
+            (openclaw--keepalive-interval nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        ;; Simulate challenge
+        (oc-mock--simulate-message
+         (json-encode `((type . "event")
+                        (event . "connect.challenge")
+                        (payload . ((nonce . "n1") (ts . 1000))))))
+        ;; Find connect request and respond with tickIntervalMs
+        (let* ((connect-frame (oc-mock--last-sent-parsed))
+               (req-id (alist-get 'id connect-frame)))
+          (oc-mock--simulate-message
+           (json-encode `((type . "res")
+                          (id . ,req-id)
+                          (ok . t)
+                          (payload . ((type . "hello-ok")
+                                      (protocol . 3)
+                                      (policy . ((tickIntervalMs . 15000)))))))))
+        (oc-test-assert-equal 15.0 openclaw--keepalive-interval
+                              "Keepalive interval extracted from tickIntervalMs"))
+    (openclaw--cancel-keepalive)
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-13.3-keepalive-sends-ping
+  "SPEC-13.3: Keepalive function sends a ping request."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (setq oc-mock--sent-frames nil)
+        (openclaw--send-keepalive)
+        (let* ((sent (oc-mock--last-sent-parsed))
+               (method (alist-get 'method sent)))
+          (oc-test-assert-equal "ping" method
+                                "Keepalive sends ping method")))
+    (openclaw--cancel-keepalive)
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-13.4-keepalive-cancelled-on-close
+  "SPEC-13.4: Keepalive timer cancelled on explicit close."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-keepalive t))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        ;; Manually set keepalive to simulate it running
+        (setq openclaw--keepalive-interval 15.0)
+        (openclaw--start-keepalive)
+        (oc-test-assert-nonnil openclaw--keepalive-timer
+                               "Keepalive timer is running")
+        (openclaw-close-connection)
+        (oc-test-assert-nil openclaw--keepalive-timer
+                            "Keepalive timer cancelled after close"))
+    (openclaw--cancel-keepalive)
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-13.5-keepalive-disabled-when-off
+  "SPEC-13.5: Keepalive does not start when openclaw-keepalive is nil."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-keepalive nil))
+        (setq openclaw--keepalive-interval 15.0)
+        (openclaw--start-keepalive)
+        (oc-test-assert-nil openclaw--keepalive-timer
+                            "Keepalive timer not started when disabled"))
+    (openclaw--cancel-keepalive)
+    (oc-mock--uninstall)))
+
+;;; ============================================================
 ;;; Integration: Full connect + session flow
 ;;; ============================================================
 
