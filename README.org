@@ -139,6 +139,28 @@ You can still use OpenClaw slash commands directly by typing them in the chat bu
 
 See the [[https://docs.openclaw.ai/gateway][OpenClaw Gateway documentation]] for more details.
 
+* Troubleshooting
+
+** Authentication failures with gateway v2026.3.7+
+
+Starting with OpenClaw gateway v2026.3.7, the =gateway.auth.mode= configuration
+field is required.  If you see authentication errors ("auth mode not configured"
+or similar), ensure your =~/.openclaw/openclaw.json= includes:
+
+#+begin_src json
+{
+  "gateway": {
+    "auth": {
+      "mode": "token",
+      "token": "your-token-here"
+    }
+  }
+}
+#+end_src
+
+Valid =mode= values: =token=, =password=, =none=.  When =mode= is omitted the
+gateway will reject all connection attempts.
+
 * Development
 
 ** Running tests

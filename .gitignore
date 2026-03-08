@@ -14,3 +14,7 @@
 # Development
 /.dir-locals.el
 /test/*.elc
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db

@@ -190,7 +190,45 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
   "Marker for separator line before input area in chat buffer.")
 
 (defvar-local openclaw--run-state 'idle
-  "Current run state for this chat buffer: 'idle or 'thinking.")
+  "Current run state for this chat buffer: \\='idle or \\='thinking.")
+
+(defvar-local openclaw--streaming-text ""
+  "Accumulated streaming delta text for the current assistant turn.")
+
+(defvar-local openclaw--streaming-marker nil
+  "Marker pointing to the start of the streaming assistant message.")
+
+
+;;; Reconnection
+
+(defvar openclaw--reconnect-timer nil
+  "Timer for pending reconnection attempt.")
+
+(defvar openclaw--reconnect-attempts 0
+  "Number of consecutive reconnection attempts.")
+
+(defvar openclaw--reconnect-url nil
+  "URL used for the last connection (used by auto-reconnect).")
+
+(defcustom openclaw-auto-reconnect t
+  "Whether to automatically reconnect on dropped connections."
+  :type 'boolean
+  :group 'openclaw)
+
+(defcustom openclaw-reconnect-max-attempts 10
+  "Maximum number of consecutive reconnection attempts before giving up."
+  :type 'integer
+  :group 'openclaw)
+
+(defcustom openclaw-reconnect-base-delay 1.0
+  "Base delay in seconds for reconnection backoff."
+  :type 'float
+  :group 'openclaw)
+
+(defcustom openclaw-reconnect-max-delay 60.0
+  "Maximum delay in seconds for reconnection backoff."
+  :type 'float
+  :group 'openclaw)
 
 
 ;;; Keymaps
@@ -405,10 +443,7 @@ EVENT is the raw JSON string."
          (setq openclaw--connect-nonce nonce)
          (openclaw--send-connect)))
       ("chat"
-       (let ((session-key (or (alist-get 'sessionKey payload)
-                              (alist-get 'session_key payload))))
-         (when (and (stringp session-key) (> (length session-key) 0))
-           (openclaw--fetch-history session-key))))
+       (openclaw--handle-chat-event payload))
       (_
        (let ((method (alist-get 'method data))
              (params (alist-get 'params data)))
@@ -442,12 +477,51 @@ EVENT is the raw JSON string."
           (error
            (message "OpenClaw parse error: %s" err)))))))
 
+(defun openclaw--reconnect-delay ()
+  "Compute delay for next reconnection attempt using bounded exponential backoff."
+  (min openclaw-reconnect-max-delay
+       (* openclaw-reconnect-base-delay
+          (expt 2 (min openclaw--reconnect-attempts 10)))))
+
+(defun openclaw--cancel-reconnect ()
+  "Cancel any pending reconnection timer."
+  (when openclaw--reconnect-timer
+    (cancel-timer openclaw--reconnect-timer)
+    (setq openclaw--reconnect-timer nil)))
+
+(defun openclaw--schedule-reconnect ()
+  "Schedule a reconnection attempt with exponential backoff."
+  (openclaw--cancel-reconnect)
+  (when (and openclaw-auto-reconnect
+             openclaw--reconnect-url
+             (< openclaw--reconnect-attempts openclaw-reconnect-max-attempts))
+    (let ((delay (openclaw--reconnect-delay)))
+      (message "OpenClaw: reconnecting in %.1fs (attempt %d/%d)..."
+               delay
+               (1+ openclaw--reconnect-attempts)
+               openclaw-reconnect-max-attempts)
+      (setq openclaw--reconnect-timer
+            (run-at-time delay nil #'openclaw--attempt-reconnect)))))
+
+(defun openclaw--attempt-reconnect ()
+  "Attempt to reconnect to the gateway."
+  (setq openclaw--reconnect-timer nil)
+  (cl-incf openclaw--reconnect-attempts)
+  (condition-case err
+      (when openclaw--reconnect-url
+        (openclaw-connect openclaw--reconnect-url))
+    (error
+     (message "OpenClaw: reconnect failed: %s" err)
+     (openclaw--schedule-reconnect))))
+
 (defun openclaw--on-close (_ws)
   "Handle WebSocket close event."
   (message "OpenClaw connection closed")
   (setq openclaw--websocket nil
         openclaw--handshake-complete nil)
-  (openclaw--update-mode-line))
+  (openclaw--update-mode-line)
+  ;; Auto-reconnect if enabled and we have a URL
+  (openclaw--schedule-reconnect))
 
 (defun openclaw--on-error (_ws err)
   "Handle WebSocket error ERR."
@@ -457,7 +531,9 @@ EVENT is the raw JSON string."
   "Handle WebSocket open event for WS."
   (setq openclaw--websocket ws
         openclaw--connect-nonce nil
-        openclaw--handshake-complete nil))
+        openclaw--handshake-complete nil
+        openclaw--reconnect-attempts 0)
+  (openclaw--cancel-reconnect))
 
 
 ;;; Connection Management
@@ -469,8 +545,10 @@ If URL is nil, use `openclaw-gateway-url'."
   (interactive)
   (setq url (or url openclaw-gateway-url))
   (when openclaw--websocket
-    (openclaw-close-connection))
+    (let ((openclaw-auto-reconnect nil)) ; suppress reconnect on intentional close
+      (openclaw-close-connection)))
 
+  (setq openclaw--reconnect-url url)
   (message "Connecting to OpenClaw at %s..." url)
 
   (let ((ws (websocket-open
@@ -484,6 +562,8 @@ If URL is nil, use `openclaw-gateway-url'."
 (defun openclaw-close-connection ()
   "Close the connection to OpenClaw gateway."
   (interactive)
+  (openclaw--cancel-reconnect)
+  (setq openclaw--reconnect-url nil)  ; prevent auto-reconnect on explicit close
   (when openclaw--websocket
     (websocket-close openclaw--websocket)
     (setq openclaw--websocket nil
@@ -864,11 +944,13 @@ Optional DRAFT pre-fills the input box."
 
 (defun openclaw--insert-message-before-input (prefix prefix-face content)
   "Insert a chat message line before input area.
-PREFIX uses PREFIX-FACE, followed by CONTENT text."
+PREFIX uses PREFIX-FACE, followed by CONTENT text.
+Advances `openclaw--input-separator-marker' past inserted text so
+that `openclaw--refresh-status-bar' does not overwrite the message."
   (let ((inhibit-read-only t)
         (insert-pos (if (and openclaw--input-separator-marker
                              (marker-buffer openclaw--input-separator-marker))
-                        openclaw--input-separator-marker
+                        (marker-position openclaw--input-separator-marker)
                       (point-max))))
     (save-excursion
       (goto-char insert-pos)
@@ -877,7 +959,11 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
         (openclaw--insert-rendered-content content)
         (when (= content-start (point))
           (insert "")))
-      (insert "\n"))))
+      (insert "\n")
+      ;; Advance separator marker past the newly inserted text.
+      (when (and openclaw--input-separator-marker
+                 (marker-buffer openclaw--input-separator-marker))
+        (set-marker openclaw--input-separator-marker (point))))))
 
 (defun openclaw--fetch-history (session-key)
   "Fetch chat history for SESSION-KEY."
@@ -933,6 +1019,118 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
                                'idle))))
              (openclaw--insert-input-area draft)
              (goto-char (point-max))))))))))
+
+(defmacro openclaw--dispatch-to-session-buffer (session-key &rest body)
+  "Execute BODY in the first chat buffer matching SESSION-KEY."
+  (declare (indent 1))
+  `(cl-dolist (buf (buffer-list))
+     (with-current-buffer buf
+       (when (and (eq major-mode 'openclaw-chat-mode)
+                  (equal openclaw--current-session ,session-key))
+         ,@body
+         (cl-return)))))
+
+(defun openclaw--handle-chat-event (payload)
+  "Handle a chat event PAYLOAD incrementally.
+Processes state=delta for streaming, state=final for completion,
+state=error for errors.  Only falls back to full history fetch
+when no state field is present (legacy events)."
+  (let* ((session-key (or (alist-get 'sessionKey payload)
+                          (alist-get 'session_key payload)))
+         (state (alist-get 'state payload))
+         (delta-text (alist-get 'delta payload))
+         (content-text (openclaw--content->text (alist-get 'content payload)))
+         (error-msg (alist-get 'error payload)))
+    (when (and (stringp session-key) (> (length session-key) 0))
+      (pcase state
+        ("delta"
+         ;; Streaming delta: append text incrementally to buffer
+         (openclaw--append-streaming-delta session-key (or delta-text content-text "")))
+        ("final"
+         ;; Streaming complete: finalize the streamed message
+         (openclaw--finalize-streaming session-key content-text))
+        ("error"
+         ;; Error during streaming — finalize and show error in one pass
+         (let ((err-text (format "%s" (or error-msg "Unknown streaming error"))))
+           (openclaw--dispatch-to-session-buffer session-key
+             ;; Reset streaming state inline
+             (let ((inhibit-read-only t))
+               (when openclaw--streaming-marker
+                 (save-excursion
+                   (goto-char openclaw--streaming-marker)
+                   (insert "\n"))
+                 (set-marker openclaw--streaming-marker nil))
+               (setq-local openclaw--streaming-text "")
+               (setq-local openclaw--streaming-marker nil))
+             ;; Insert error message
+             (openclaw--insert-message-before-input
+              "Error: " 'openclaw-system-face err-text)
+             (setq-local openclaw--run-state 'idle)
+             (openclaw--refresh-status-bar))))
+        (_
+         ;; Legacy event without state field — fall back to history fetch
+         (openclaw--fetch-history session-key))))))
+
+(defun openclaw--append-streaming-delta (session-key text)
+  "Append streaming delta TEXT to the chat buffer for SESSION-KEY."
+  (cl-dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and (eq major-mode 'openclaw-chat-mode)
+                 (equal openclaw--current-session session-key))
+        (let ((inhibit-read-only t))
+          ;; First delta — insert the role label and set up marker
+          (when (string-empty-p (or openclaw--streaming-text ""))
+            (setq-local openclaw--run-state 'thinking)
+            (openclaw--refresh-status-bar)
+            (let ((insert-pos (if (and openclaw--input-separator-marker
+                                       (marker-buffer openclaw--input-separator-marker))
+                                  openclaw--input-separator-marker
+                                (point-max)))
+                  (role-label (openclaw--role-label "assistant" session-key)))
+              (save-excursion
+                (goto-char insert-pos)
+                (insert (propertize (format "%s: " role-label)
+                                   'face 'openclaw-assistant-face))
+                (setq-local openclaw--streaming-marker (copy-marker (point) t)))))
+          ;; Append the delta text at the streaming marker
+          (when (and openclaw--streaming-marker
+                     (marker-buffer openclaw--streaming-marker))
+            (save-excursion
+              (goto-char openclaw--streaming-marker)
+              (insert (openclaw--normalize-text text))
+              (set-marker openclaw--streaming-marker (point))))
+          (setq-local openclaw--streaming-text
+                      (concat (or openclaw--streaming-text "") text)))
+        (cl-return)))))
+
+(defun openclaw--finalize-streaming (session-key final-text)
+  "Finalize streaming for SESSION-KEY.
+If FINAL-TEXT is non-nil, replace the streamed content with it."
+  (cl-dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and (eq major-mode 'openclaw-chat-mode)
+                 (equal openclaw--current-session session-key))
+        (let ((inhibit-read-only t))
+          ;; If we never got a delta (no streaming marker), insert the final text
+          (if (or (not openclaw--streaming-marker)
+                  (not (marker-buffer openclaw--streaming-marker)))
+              (when (and final-text (not (string-empty-p final-text)))
+                (openclaw--insert-message-before-input
+                 (format "%s: " (openclaw--role-label "assistant" session-key))
+                 'openclaw-assistant-face
+                 final-text))
+            ;; Streaming was in progress — add newline after streamed content
+            (save-excursion
+              (goto-char openclaw--streaming-marker)
+              (insert "\n")))
+          ;; Reset streaming state
+          (setq-local openclaw--streaming-text "")
+          (when openclaw--streaming-marker
+            (set-marker openclaw--streaming-marker nil))
+          (setq-local openclaw--streaming-marker nil)
+          (setq-local openclaw--run-state 'idle)
+          (openclaw--refresh-status-bar))
+        (cl-return)))))
 
 (defun openclaw--handle-chat-message (params)
   "Handle incoming chat message PARAMS."
@@ -995,11 +1193,7 @@ PREFIX uses PREFIX-FACE, followed by CONTENT text."
        (when (and result (listp result) (alist-get 'error result))
          (setq-local openclaw--run-state 'idle)
          (openclaw--refresh-status-bar)
-         (message "Send error: %s" (alist-get 'error result)))
-       ;; Refresh history after brief delay
-       (when openclaw--current-session
-         (run-at-time 0.3 nil #'openclaw--fetch-history
-                      openclaw--current-session))))
+         (message "Send error: %s" (alist-get 'error result)))))
 
     (goto-char (point-max))))
 

@@ -646,6 +646,307 @@
     (oc-mock--uninstall)))
 
 ;;; ============================================================
+;;; SPEC-10: Reconnection
+;;; ============================================================
+
+(oc-test-deftest spec-10.1-reconnect-on-close
+  "SPEC-10.1: Auto-reconnect schedules after connection close."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect t)
+            (openclaw-reconnect-base-delay 0.1)
+            (scheduled nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        ;; Verify reconnect URL is stored
+        (oc-test-assert-equal "ws://127.0.0.1:18789" openclaw--reconnect-url
+                              "Reconnect URL stored after connect")
+        ;; Simulate connection drop
+        (advice-add 'run-at-time :override
+                    (lambda (delay _repeat fn &rest _args)
+                      (setq scheduled delay)
+                      nil)
+                    '((name . oc-test-timer-spy)))
+        (setq openclaw--reconnect-url "ws://127.0.0.1:18789")
+        (openclaw--on-close nil)
+        (advice-remove 'run-at-time 'oc-test-timer-spy)
+        (oc-test-assert-nonnil scheduled
+                               "Reconnect timer scheduled after close")
+        (oc-test-assert (and (numberp scheduled) (> scheduled 0))
+                        "Reconnect delay is positive"))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-10.2-no-reconnect-on-explicit-close
+  "SPEC-10.2: Explicit close does not auto-reconnect."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect t))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (openclaw-close-connection)
+        (oc-test-assert-nil openclaw--reconnect-url
+                            "Reconnect URL cleared after explicit close")
+        (oc-test-assert-nil openclaw--reconnect-timer
+                            "No reconnect timer after explicit close"))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-10.3-exponential-backoff
+  "SPEC-10.3: Reconnect delay grows exponentially."
+  (let ((openclaw-reconnect-base-delay 1.0)
+        (openclaw-reconnect-max-delay 60.0))
+    (setq openclaw--reconnect-attempts 0)
+    (let ((d0 (openclaw--reconnect-delay)))
+      (oc-test-assert-equal 1.0 d0 "First attempt delay is base"))
+    (setq openclaw--reconnect-attempts 3)
+    (let ((d3 (openclaw--reconnect-delay)))
+      (oc-test-assert-equal 8.0 d3 "Attempt 3 delay is 8s"))
+    (setq openclaw--reconnect-attempts 20)
+    (let ((d20 (openclaw--reconnect-delay)))
+      (oc-test-assert-equal 60.0 d20 "Delay capped at max"))))
+
+(oc-test-deftest spec-10.4-reconnect-resets-on-success
+  "SPEC-10.4: Reconnect attempts reset on successful open."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (setq openclaw--reconnect-attempts 5)
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-test-assert-equal 0 openclaw--reconnect-attempts
+                              "Reconnect attempts reset on open"))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-10.5-idle-then-send
+  "SPEC-10.5: Can send message after idle reconnection."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (openclaw-auto-reconnect nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (setq oc-mock--sent-frames nil)
+        (with-temp-buffer
+          (openclaw-chat-mode)
+          (setq-local openclaw--current-session "test-sess")
+          (openclaw--insert-input-area "")
+          ;; Simulate connection drop and immediate reconnect
+          (setq openclaw--websocket nil
+                openclaw--handshake-complete nil)
+          ;; Reconnect
+          (openclaw-connect "ws://127.0.0.1:18789")
+          (oc-mock--complete-handshake)
+          (setq oc-mock--sent-frames nil)
+          ;; Now send
+          (goto-char (point-max))
+          (insert "hello after idle")
+          (openclaw-send-message)
+          (let* ((sent (oc-mock--last-sent-parsed))
+                 (params (alist-get 'params sent)))
+            (oc-test-assert-equal "chat.send" (alist-get 'method sent)
+                                  "chat.send sent after reconnect")
+            (oc-test-assert-equal "hello after idle" (alist-get 'message params)
+                                  "Message text correct after idle reconnect"))))
+    (openclaw--cancel-reconnect)
+    (oc-mock--uninstall)))
+
+;;; ============================================================
+;;; SPEC-11: Streaming / Delta Handling
+;;; ============================================================
+
+(oc-test-deftest spec-11.1-delta-no-refetch
+  "SPEC-11.1: Chat event with state=delta does NOT trigger history fetch."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (history-fetched nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (puthash "test-sess" '((key . "test-sess")) openclaw--sessions)
+        (let ((buf (get-buffer-create "*test-sess*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "test-sess")
+            (openclaw--insert-input-area ""))
+          (advice-add 'openclaw--fetch-history :before
+                      (lambda (&rest _) (setq history-fetched t))
+                      '((name . oc-test-track-delta-fetch)))
+          (setq oc-mock--sent-frames nil)
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "test-sess")
+                                      (state . "delta")
+                                      (delta . "Hello"))))))
+          (advice-remove 'openclaw--fetch-history 'oc-test-track-delta-fetch)
+          (oc-test-assert-nil history-fetched
+                              "Delta event did NOT trigger history fetch")
+          (with-current-buffer buf
+            (oc-test-assert-match "Hello" (buffer-string)
+                                  "Delta text appears in buffer"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-11.2-streaming-accumulates
+  "SPEC-11.2: Multiple deltas accumulate in buffer."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*stream-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "stream-sess")
+            (openclaw--insert-input-area ""))
+          ;; Send three deltas
+          (dolist (chunk '("Hello" " world" "!"))
+            (oc-mock--simulate-message
+             (json-encode `((type . "event")
+                            (event . "chat")
+                            (payload . ((sessionKey . "stream-sess")
+                                        (state . "delta")
+                                        (delta . ,chunk)))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "Hello world!" (buffer-string)
+                                  "All deltas accumulated")
+            (oc-test-assert-equal "Hello world!" openclaw--streaming-text
+                                  "Streaming text variable tracks accumulated content"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-11.3-final-resets-state
+  "SPEC-11.3: state=final resets streaming and sets idle."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*final-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "final-sess")
+            (openclaw--insert-input-area ""))
+          ;; Delta then final
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "final-sess")
+                                      (state . "delta")
+                                      (delta . "thinking..."))))))
+          (with-current-buffer buf
+            (oc-test-assert-equal 'thinking openclaw--run-state
+                                  "State is thinking during streaming"))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "final-sess")
+                                      (state . "final")
+                                      (content . "thinking..."))))))
+          (with-current-buffer buf
+            (oc-test-assert-equal 'idle openclaw--run-state
+                                  "State is idle after final")
+            (oc-test-assert-equal "" openclaw--streaming-text
+                                  "Streaming text reset after final")
+            (oc-test-assert-nil openclaw--streaming-marker
+                                "Streaming marker cleared after final"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-11.4-error-state-handled
+  "SPEC-11.4: state=error shows error and resets to idle."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*error-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "err-sess")
+            (openclaw--insert-input-area ""))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "err-sess")
+                                      (state . "error")
+                                      (error . "rate limit exceeded"))))))
+          (with-current-buffer buf
+            (oc-test-assert-equal 'idle openclaw--run-state
+                                  "State is idle after error")
+            (oc-test-assert-match "rate limit exceeded" (buffer-string)
+                                  "Error message displayed in buffer"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-11.5-legacy-chat-event-fetches-history
+  "SPEC-11.5: Chat event without state falls back to history fetch."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok")
+            (history-fetched nil))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (advice-add 'openclaw--fetch-history :before
+                    (lambda (&rest _) (setq history-fetched t))
+                    '((name . oc-test-track-legacy-fetch)))
+        (oc-mock--simulate-message
+         (json-encode `((type . "event")
+                        (event . "chat")
+                        (payload . ((sessionKey . "some-sess"))))))
+        (advice-remove 'openclaw--fetch-history 'oc-test-track-legacy-fetch)
+        (oc-test-assert-nonnil history-fetched
+                               "Legacy chat event triggers history fetch"))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-11.6-send-after-long-stream
+  "SPEC-11.6: Can send new message after long streaming (think) completes."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (setq oc-mock--sent-frames nil)
+        (let ((buf (get-buffer-create "*long-stream*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq-local openclaw--current-session "think-sess")
+            (openclaw--insert-input-area ""))
+          ;; Simulate a long stream (many deltas + final)
+          (dotimes (i 20)
+            (oc-mock--simulate-message
+             (json-encode `((type . "event")
+                            (event . "chat")
+                            (payload . ((sessionKey . "think-sess")
+                                        (state . "delta")
+                                        (delta . ,(format "chunk-%d " i))))))))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "think-sess")
+                                      (state . "final")
+                                      (content . "full response"))))))
+          ;; Now send a new message
+          (with-current-buffer buf
+            (oc-test-assert-equal 'idle openclaw--run-state
+                                  "State is idle after long stream final")
+            (goto-char (point-max))
+            (insert "follow-up")
+            (setq oc-mock--sent-frames nil)
+            (openclaw-send-message)
+            (let* ((sent (oc-mock--last-sent-parsed))
+                   (params (alist-get 'params sent)))
+              (oc-test-assert-equal "chat.send" (alist-get 'method sent)
+                                    "chat.send sent after long stream")
+              (oc-test-assert-equal "follow-up" (alist-get 'message params)
+                                    "Message text correct after long stream")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+;;; ============================================================
 ;;; Integration: Full connect + session flow
 ;;; ============================================================
 
