@@ -18,3 +18,6 @@
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+node_modules/
+test/node_modules/
+test/captured-frames.json

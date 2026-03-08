@@ -1,0 +1,24 @@
+#!/bin/bash
+# Pre-push hook: runs unit tests and E2E tests before allowing push.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+echo "=== Pre-push: running unit tests ==="
+emacs --batch -L . -L test -l test-openclaw.el -f oc-test-run-all 2>&1
+if [ $? -ne 0 ]; then
+    echo "Unit tests failed! Push aborted."
+    exit 1
+fi
+
+echo ""
+echo "=== Pre-push: running E2E tests ==="
+TERM=${TERM:-xterm-256color} bash test/e2e-test.sh 2>&1
+if [ $? -ne 0 ]; then
+    echo "E2E tests failed! Push aborted."
+    exit 1
+fi
+
+echo ""
+echo "=== All tests passed, push proceeding ==="

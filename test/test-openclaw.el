@@ -1246,6 +1246,232 @@
     (oc-mock--uninstall)))
 
 ;;; ============================================================
+;;; SPEC-14: Real Gateway Protocol (message.content array format)
+;;; ============================================================
+
+(oc-test-deftest spec-14.1-real-protocol-streaming-delta
+  "SPEC-14.1: Streaming delta with payload.message.content array."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*real-proto-delta*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:rp:main")
+            (openclaw--insert-input-area ""))
+          ;; First delta: accumulated text "hello"
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rp:main")
+                          (state . "delta")
+                          (seq . 2)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "hello"))]))))))))
+          ;; Second delta: accumulated text "hello world"
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rp:main")
+                          (state . "delta")
+                          (seq . 3)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "hello world"))]))))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "hello world" (buffer-string)
+                                  "Accumulated delta text is displayed correctly")
+            ;; Verify "hello world" appears exactly once (not "hellohello world")
+            (let* ((content (buffer-string))
+                   (count 0) (start 0))
+              (while (string-match "hello world" content start)
+                (setq count (1+ count) start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "\"hello world\" appears exactly once (no duplication)")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-14.2-real-protocol-final
+  "SPEC-14.2: Final event with payload.message.content array."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*real-proto-final*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:rpf:main")
+            (openclaw--insert-input-area ""))
+          ;; Delta then final using real protocol format
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpf:main")
+                          (state . "delta")
+                          (seq . 2)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "pong"))]))))))))
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpf:main")
+                          (state . "final")
+                          (seq . 3)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "pong"))]))))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "pong" (buffer-string)
+                                  "Final text is visible in buffer")
+            ;; Should appear exactly once
+            (let* ((content (buffer-string))
+                   (count 0) (start 0))
+              (while (string-match "pong" content start)
+                (setq count (1+ count) start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "\"pong\" appears exactly once (no duplicate)")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-14.3-real-protocol-no-duplicate-with-chat-message
+  "SPEC-14.3: No duplicate when chat.message follows real-protocol streaming."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*real-proto-nodup*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:rpd:main")
+            (openclaw--insert-input-area ""))
+          ;; Real protocol streaming
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpd:main")
+                          (state . "delta")
+                          (seq . 2)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "test reply"))]))))))))
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpd:main")
+                          (state . "final")
+                          (seq . 3)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "test reply"))]))))))))
+          ;; Redundant chat.message
+          (oc-mock--simulate-message
+           (json-encode `((method . "chat.message")
+                          (params . ((sessionKey . "agent:rpd:main")
+                                     (role . "assistant")
+                                     (content . "test reply"))))))
+          (with-current-buffer buf
+            (let* ((content (buffer-string))
+                   (count 0) (start 0))
+              (while (string-match "test reply" content start)
+                (setq count (1+ count) start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "Text appears exactly once despite chat.message echo")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-14.4-real-protocol-non-streamed-final
+  "SPEC-14.4: Final without prior delta inserts text (non-streamed response)."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*real-proto-nsdelta*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:rpns:main")
+            (openclaw--insert-input-area ""))
+          ;; Only a final event, no prior deltas
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpns:main")
+                          (state . "final")
+                          (seq . 2)
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "fast reply"))]))))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "fast reply" (buffer-string)
+                                  "Non-streamed final message is inserted"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-14.5-real-protocol-multi-delta-accumulation
+  "SPEC-14.5: Multiple accumulated deltas produce correct final text."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*real-proto-multi*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:rpm:main")
+            (openclaw--insert-input-area ""))
+          ;; Simulate 4 accumulated deltas like real gateway
+          (dolist (accum '("H" "He" "Hel" "Hello"))
+            (oc-mock--simulate-message
+             (json-encode
+              `((type . "event")
+                (event . "chat")
+                (payload . ((sessionKey . "agent:rpm:main")
+                            (state . "delta")
+                            (message . ((role . "assistant")
+                                        (content . [((type . "text")
+                                                      (text . ,accum))])))))))))
+          ;; Final
+          (oc-mock--simulate-message
+           (json-encode
+            `((type . "event")
+              (event . "chat")
+              (payload . ((sessionKey . "agent:rpm:main")
+                          (state . "final")
+                          (message . ((role . "assistant")
+                                      (content . [((type . "text")
+                                                    (text . "Hello"))]))))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "Hello" (buffer-string)
+                                  "Multi-delta accumulation produces correct text")
+            ;; Must not have "HHeHelHello" or duplicated text
+            (let* ((content (buffer-string))
+                   (count 0) (start 0))
+              (while (string-match "Hello" content start)
+                (setq count (1+ count) start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "\"Hello\" appears exactly once (no accumulated garbage)")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+;;; ============================================================
 ;;; SPEC-13: Keepalive / Heartbeat Pings
 ;;; ============================================================
 

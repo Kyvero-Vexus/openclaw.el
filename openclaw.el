@@ -1127,18 +1127,35 @@ that `openclaw--refresh-status-bar' does not overwrite the message."
   "Handle a chat event PAYLOAD incrementally.
 Processes state=delta for streaming, state=final for completion,
 state=error for errors.  Only falls back to full history fetch
-when no state field is present (legacy events)."
+when no state field is present (legacy events).
+
+The real gateway protocol nests content in payload.message.content
+as an array of content parts.  Legacy events may use payload.delta
+or payload.content directly.  We handle both."
   (let* ((session-key (or (alist-get 'sessionKey payload)
                           (alist-get 'session_key payload)))
          (state (alist-get 'state payload))
-         (delta-text (alist-get 'delta payload))
-         (content-text (openclaw--content->text (alist-get 'content payload)))
+         ;; Real protocol: content in payload.message.content (array of parts)
+         (message (alist-get 'message payload))
+         (message-content (when message (alist-get 'content message)))
+         ;; Legacy protocol: payload.delta or payload.content
+         (legacy-delta (alist-get 'delta payload))
+         (legacy-content (alist-get 'content payload))
+         ;; Resolve content text from the best available source
+         (content-text (openclaw--content->text
+                        (or message-content legacy-content)))
          (error-msg (alist-get 'error payload)))
     (when (and (stringp session-key) (> (length session-key) 0))
       (pcase state
         ("delta"
-         ;; Streaming delta: append text incrementally to buffer
-         (openclaw--append-streaming-delta session-key (or delta-text content-text "")))
+         ;; Real protocol sends accumulated text in each delta event
+         ;; (payload.message.content contains the full text so far).
+         ;; Legacy protocol sends just the new delta in payload.delta.
+         (if legacy-delta
+             ;; Legacy: delta text is the actual incremental delta
+             (openclaw--append-streaming-delta session-key legacy-delta)
+           ;; Real protocol: content-text is accumulated; compute actual delta
+           (openclaw--update-streaming-accumulated session-key content-text)))
         ("final"
          ;; Streaming complete: finalize the streamed message
          (openclaw--finalize-streaming session-key content-text))
@@ -1205,6 +1222,37 @@ when no state field is present (legacy events)."
           (setq-local openclaw--streaming-text
                       (concat (or openclaw--streaming-text "") text)))
         (cl-return)))))
+
+(defun openclaw--update-streaming-accumulated (session-key accumulated-text)
+  "Update streaming for SESSION-KEY with ACCUMULATED-TEXT.
+The real gateway protocol sends the full accumulated response text
+in each delta event (not just the new delta).  This function computes
+the actual new delta by comparing with `openclaw--streaming-text'
+and appends only the new portion."
+  (let ((delta ""))
+    ;; Find the buffer to compute the delta
+    (cl-dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and (eq major-mode 'openclaw-chat-mode)
+                   (equal openclaw--current-session session-key))
+          (let ((already (or openclaw--streaming-text "")))
+            (setq delta
+                  (cond
+                   ;; Accumulated text extends what we already have — extract new part
+                   ((and (stringp accumulated-text)
+                         (>= (length accumulated-text) (length already))
+                         (string-prefix-p already accumulated-text))
+                    (substring accumulated-text (length already)))
+                   ;; Accumulated text differs completely — use as-is
+                   ((and (stringp accumulated-text)
+                         (not (string-empty-p accumulated-text)))
+                    accumulated-text)
+                   ;; Nothing useful
+                   (t ""))))
+          (cl-return))))
+    ;; Now append the computed delta using the existing function
+    (unless (string-empty-p delta)
+      (openclaw--append-streaming-delta session-key delta))))
 
 (defun openclaw--finalize-streaming (session-key final-text)
   "Finalize streaming for SESSION-KEY.
