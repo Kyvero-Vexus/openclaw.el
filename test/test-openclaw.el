@@ -1130,6 +1130,122 @@
     (oc-mock--uninstall)))
 
 ;;; ============================================================
+;;; SPEC-12.5/12.6: Duplicate & Blank Message Regression
+;;; ============================================================
+
+(oc-test-deftest spec-12.5-no-duplicate-after-streaming
+  "SPEC-12.5: chat.message after streaming final does not duplicate assistant text."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*dup-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:dup:main")
+            (openclaw--insert-input-area ""))
+          ;; Stream deltas then final
+          (dolist (chunk '("hello" " world"))
+            (oc-mock--simulate-message
+             (json-encode `((type . "event")
+                            (event . "chat")
+                            (payload . ((sessionKey . "agent:dup:main")
+                                        (state . "delta")
+                                        (delta . ,chunk)))))))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "agent:dup:main")
+                                      (state . "final")
+                                      (content . "hello world"))))))
+          ;; Now simulate the redundant chat.message that the gateway sends
+          (oc-mock--simulate-message
+           (json-encode `((method . "chat.message")
+                          (params . ((sessionKey . "agent:dup:main")
+                                     (role . "assistant")
+                                     (content . "hello world"))))))
+          (with-current-buffer buf
+            (let* ((content (buffer-string))
+                   (needle "hello world")
+                   (count 0)
+                   (start 0))
+              (while (string-match (regexp-quote needle) content start)
+                (setq count (1+ count)
+                      start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "Assistant text appears exactly once (no duplicate)")
+              ;; Flag should have been cleared
+              (oc-test-assert-nil openclaw--stream-finalized-p
+                                  "stream-finalized-p cleared after suppression")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-12.6-non-streamed-message-still-inserted
+  "SPEC-12.6: Non-streamed chat.message (no prior streaming) is inserted normally."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*no-stream-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:ns:main")
+            (openclaw--insert-input-area ""))
+          ;; Send a plain chat.message with no prior streaming
+          (oc-mock--simulate-message
+           (json-encode `((method . "chat.message")
+                          (params . ((sessionKey . "agent:ns:main")
+                                     (role . "assistant")
+                                     (content . "quick receipt"))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "quick receipt" (buffer-string)
+                                  "Non-streamed assistant message is visible"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+(oc-test-deftest spec-12.7-user-message-not-suppressed
+  "SPEC-12.7: User chat.message after streaming is not suppressed."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*user-msg-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:um:main")
+            (openclaw--insert-input-area ""))
+          ;; Stream then finalize (sets the flag)
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "agent:um:main")
+                                      (state . "delta")
+                                      (delta . "reply"))))))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "agent:um:main")
+                                      (state . "final")
+                                      (content . "reply"))))))
+          ;; A user message should still go through even with flag set
+          (oc-mock--simulate-message
+           (json-encode `((method . "chat.message")
+                          (params . ((sessionKey . "agent:um:main")
+                                     (role . "user")
+                                     (content . "new question"))))))
+          (with-current-buffer buf
+            (oc-test-assert-match "new question" (buffer-string)
+                                  "User message is not suppressed by stream-finalized flag"))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
+;;; ============================================================
 ;;; SPEC-13: Keepalive / Heartbeat Pings
 ;;; ============================================================
 

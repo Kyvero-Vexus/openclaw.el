@@ -198,6 +198,12 @@ Default matches session key exactly, e.g. *agent:ceo_chryso:main*."
 (defvar-local openclaw--streaming-marker nil
   "Marker pointing to the start of the streaming assistant message.")
 
+(defvar-local openclaw--stream-finalized-p nil
+  "Non-nil when streaming was just finalized.
+Set by `openclaw--finalize-streaming', cleared by
+`openclaw--handle-chat-message' to suppress the duplicate
+chat.message insert that the gateway sends after streaming ends.")
+
 
 ;;; Reconnection
 
@@ -558,6 +564,7 @@ from corrupting the display after a mid-stream connection drop."
             (set-marker openclaw--streaming-marker nil))
           (setq-local openclaw--streaming-marker nil)
           (setq-local openclaw--streaming-text "")
+          (setq-local openclaw--stream-finalized-p nil)
           (setq-local openclaw--run-state 'idle)
           (openclaw--refresh-status-bar))))))
 
@@ -1219,17 +1226,22 @@ If FINAL-TEXT is non-nil, replace the streamed content with it."
             ;; Newline before the status bar was already inserted when
             ;; streaming started, so no extra insertion is needed here.
             nil)
-          ;; Reset streaming state
+          ;; Reset streaming state and mark as just-finalized so that
+          ;; the redundant chat.message event is suppressed.
           (setq-local openclaw--streaming-text "")
           (when openclaw--streaming-marker
             (set-marker openclaw--streaming-marker nil))
           (setq-local openclaw--streaming-marker nil)
+          (setq-local openclaw--stream-finalized-p t)
           (setq-local openclaw--run-state 'idle)
           (openclaw--refresh-status-bar))
         (cl-return)))))
 
 (defun openclaw--handle-chat-message (params)
-  "Handle incoming chat message PARAMS."
+  "Handle incoming chat message PARAMS.
+Suppresses the insert when the message is an assistant reply that
+was already rendered via streaming (detected by the
+`openclaw--stream-finalized-p' flag)."
   (let* ((session-key (alist-get 'sessionKey params))
          (role (alist-get 'role params))
          (content-text (openclaw--content->text (alist-get 'content params)))
@@ -1239,15 +1251,21 @@ If FINAL-TEXT is non-nil, replace the streamed content with it."
       (with-current-buffer buf
         (when (and (eq major-mode 'openclaw-chat-mode)
                    (equal openclaw--current-session session-key))
-          (openclaw--insert-message-before-input
-           (format "%s: " role-label)
-           role-face
-           content-text)
-          (setq-local openclaw--run-state
-                      (if (equal (format "%s" role) "user")
-                          'thinking
-                        'idle))
-          (openclaw--refresh-status-bar)
+          ;; If streaming just finalized an assistant message, this
+          ;; chat.message is a duplicate — suppress it.
+          (if (and openclaw--stream-finalized-p
+                   (equal (format "%s" role) "assistant"))
+              (setq-local openclaw--stream-finalized-p nil)
+            ;; Normal (non-streamed) message — insert it.
+            (openclaw--insert-message-before-input
+             (format "%s: " role-label)
+             role-face
+             content-text)
+            (setq-local openclaw--run-state
+                        (if (equal (format "%s" role) "user")
+                            'thinking
+                          'idle))
+            (openclaw--refresh-status-bar))
           (cl-return))))))
 
 (defun openclaw--handle-sessions-update (_params)
