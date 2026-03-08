@@ -1164,7 +1164,9 @@ when no state field is present (legacy events)."
       (when (and (eq major-mode 'openclaw-chat-mode)
                  (equal openclaw--current-session session-key))
         (let ((inhibit-read-only t))
-          ;; First delta — insert the role label and set up marker
+          ;; First delta — insert the role label and set up marker.
+          ;; Keep the status bar on its own following line so refreshes
+          ;; cannot overwrite the streamed assistant text.
           (when (string-empty-p (or openclaw--streaming-text ""))
             (setq-local openclaw--run-state 'thinking)
             (openclaw--refresh-status-bar)
@@ -1176,24 +1178,23 @@ when no state field is present (legacy events)."
               (save-excursion
                 (goto-char insert-pos)
                 (insert (propertize (format "%s: " role-label)
-                                   'face 'openclaw-assistant-face))
-                (setq-local openclaw--streaming-marker (copy-marker (point) t))
-                ;; Advance separator marker past the role label so
-                ;; status bar refresh doesn't clobber streaming content
-                (when (and openclaw--input-separator-marker
-                           (marker-buffer openclaw--input-separator-marker))
-                  (set-marker openclaw--input-separator-marker (point))))))
-          ;; Append the delta text at the streaming marker
+                                    'face 'openclaw-assistant-face))
+                (let ((stream-pos (point)))
+                  ;; Reserve a newline now; deltas are inserted before it.
+                  (insert "\n")
+                  (setq-local openclaw--streaming-marker
+                              (copy-marker stream-pos t))
+                  (when (and openclaw--input-separator-marker
+                             (marker-buffer openclaw--input-separator-marker))
+                    ;; Marker now points to the start of the status bar line.
+                    (set-marker openclaw--input-separator-marker (point)))))))
+          ;; Append the delta text at the streaming marker.
           (when (and openclaw--streaming-marker
                      (marker-buffer openclaw--streaming-marker))
             (save-excursion
               (goto-char openclaw--streaming-marker)
               (insert (openclaw--normalize-text text))
-              (set-marker openclaw--streaming-marker (point))
-              ;; Keep separator marker past all streaming content
-              (when (and openclaw--input-separator-marker
-                         (marker-buffer openclaw--input-separator-marker))
-                (set-marker openclaw--input-separator-marker (point)))))
+              (set-marker openclaw--streaming-marker (point))))
           (setq-local openclaw--streaming-text
                       (concat (or openclaw--streaming-text "") text)))
         (cl-return)))))
@@ -1214,10 +1215,10 @@ If FINAL-TEXT is non-nil, replace the streamed content with it."
                  (format "%s: " (openclaw--role-label "assistant" session-key))
                  'openclaw-assistant-face
                  final-text))
-            ;; Streaming was in progress — add newline after streamed content
-            (save-excursion
-              (goto-char openclaw--streaming-marker)
-              (insert "\n")))
+            ;; Streaming was in progress.
+            ;; Newline before the status bar was already inserted when
+            ;; streaming started, so no extra insertion is needed here.
+            nil)
           ;; Reset streaming state
           (setq-local openclaw--streaming-text "")
           (when openclaw--streaming-marker

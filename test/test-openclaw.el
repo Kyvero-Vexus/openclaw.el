@@ -818,6 +818,47 @@
           (kill-buffer buf)))
     (oc-mock--uninstall)))
 
+(oc-test-deftest spec-11.2b-streaming-does-not-overwrite-with-status
+  "SPEC-11.2b: Streaming text is preserved and status bar is not duplicated."
+  (oc-mock--install)
+  (unwind-protect
+      (let ((openclaw-gateway-token "tok"))
+        (openclaw-connect "ws://127.0.0.1:18789")
+        (oc-mock--complete-handshake)
+        (let ((buf (get-buffer-create "*stream-status-test*")))
+          (with-current-buffer buf
+            (openclaw-chat-mode)
+            (setq openclaw--current-agent "main")
+            (setq-local openclaw--current-session "agent:main:main")
+            (openclaw--insert-input-area ""))
+          (dolist (chunk '("hi" " there"))
+            (oc-mock--simulate-message
+             (json-encode `((type . "event")
+                            (event . "chat")
+                            (payload . ((sessionKey . "agent:main:main")
+                                        (state . "delta")
+                                        (delta . ,chunk)))))))
+          (oc-mock--simulate-message
+           (json-encode `((type . "event")
+                          (event . "chat")
+                          (payload . ((sessionKey . "agent:main:main")
+                                      (state . "final")
+                                      (content . "hi there"))))))
+          (with-current-buffer buf
+            (let* ((content (buffer-string))
+                   (needle "send: RET / C-c C-c")
+                   (count 0)
+                   (start 0))
+              (oc-test-assert-match "main: hi there" content
+                                    "Assistant streamed text remains visible")
+              (while (string-match (regexp-quote needle) content start)
+                (setq count (1+ count)
+                      start (match-end 0)))
+              (oc-test-assert-equal 1 count
+                                    "Exactly one status bar line remains")))
+          (kill-buffer buf)))
+    (oc-mock--uninstall)))
+
 (oc-test-deftest spec-11.3-final-resets-state
   "SPEC-11.3: state=final resets streaming and sets idle."
   (oc-mock--install)
