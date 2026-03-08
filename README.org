@@ -161,6 +161,18 @@ or similar), ensure your =~/.openclaw/openclaw.json= includes:
 Valid =mode= values: =token=, =password=, =none=.  When =mode= is omitted the
 gateway will reject all connection attempts.
 
+* Repository History
+
+On 2026-03-08, this repository's GitHub and GitLab histories were unified with a
+history-preserving merge commit on =main=:
+
+- Commit: =e8cc6dc=
+- Purpose: connect previously unrelated remote histories while preserving the
+  canonical working tree from this repository.
+
+If you're auditing old refs or bisecting across remotes, use =e8cc6dc= as the
+history unification point.
+
 * Development
 
 ** Running tests
